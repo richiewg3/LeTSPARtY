@@ -326,6 +326,68 @@
             opacity: 0.35;
             cursor: not-allowed;
         }
+
+        .restore-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .restore-dialog {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 2rem;
+            max-width: 420px;
+            width: 90%;
+            text-align: center;
+            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+        }
+
+        .restore-dialog h2 { margin-top: 0; font-size: 1.3rem; }
+        .restore-dialog p { color: #aaa; font-size: 0.9rem; margin: 12px 0 20px; }
+        .restore-dialog .timestamp { font-family: monospace; color: var(--primary); font-size: 0.85rem; }
+
+        .restore-actions {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+        }
+
+        .btn-restore {
+            padding: 10px 24px;
+            border-radius: 6px;
+            border: none;
+            font-weight: bold;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: filter 0.2s;
+        }
+        .btn-restore:hover { filter: brightness(1.15); }
+        .btn-restore-primary { background: var(--primary); color: white; }
+        .btn-restore-discard { background: #555; color: #ccc; }
+
+        .autosave-indicator {
+            position: fixed;
+            bottom: 12px;
+            right: 12px;
+            background: rgba(45, 45, 45, 0.9);
+            color: #888;
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            border-radius: 4px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            pointer-events: none;
+            z-index: 999;
+        }
+        .autosave-indicator.visible { opacity: 1; }
     </style>
 </head>
 <body>
@@ -346,6 +408,10 @@
         <label>
             <input type="checkbox" id="chkGrid" checked onchange="reAnalyze()">
             Show Error Grid
+        </label>
+        <label>
+            <input type="checkbox" id="chkRefreshMode">
+            <strong>Refresh Mode</strong>
         </label>
         <div class="history-controls">
             <button id="btnUndo" class="btn-history" onclick="undo()" disabled title="Nothing to undo">↩ Undo</button>
@@ -408,6 +474,18 @@
     </div>
 </div>
 
+<div id="restoreDialog" class="restore-overlay">
+    <div class="restore-dialog">
+        <h2>Restore Previous Session?</h2>
+        <p>A saved session was found from<br><span id="restoreTimestamp" class="timestamp"></span></p>
+        <div class="restore-actions">
+            <button id="btnRestore" class="btn-restore btn-restore-primary">Restore</button>
+            <button id="btnDiscard" class="btn-restore btn-restore-discard">Discard</button>
+        </div>
+    </div>
+</div>
+<div id="autosaveIndicator" class="autosave-indicator">Saved</div>
+
 <script>
     const fileInput = document.getElementById('fileInput');
     const resultsArea = document.getElementById('resultsArea');
@@ -431,6 +509,7 @@
     let activeHighlightIndex = -1;
     let lastErrorTiles = [];
     let lastBaseImageData = null; // ImageData from last analysis (before any highlight overlay)
+    let _pendingPaletteNames = null;
 
     // --- HISTORY SYSTEM ---
     const MAX_HISTORY = 20;
@@ -525,18 +604,21 @@
         redoStack.length = 0;
         actionFn();
         updateHistoryButtons();
+        scheduleAutosave();
     }
 
     function undo() {
         if (undoStack.length === 0) return;
         redoStack.push(createSnapshot());
         restoreSnapshot(undoStack.pop());
+        scheduleAutosave();
     }
 
     function redo() {
         if (redoStack.length === 0) return;
         undoStack.push(createSnapshot());
         restoreSnapshot(redoStack.pop());
+        scheduleAutosave();
     }
 
     function updateHistoryButtons() {
@@ -636,7 +718,10 @@
     }
 
     function reAnalyze() {
-        if(originalImage) runAnalysis();
+        if (originalImage) {
+            runAnalysis();
+            scheduleAutosave();
+        }
     }
 
     function rgbToHex(r, g, b) {
@@ -875,6 +960,7 @@
         masterPalettes.forEach(pal => sortPaletteLightToDark(pal));
 
         renderResults(masterPalettes, errorTiles, counts);
+        scheduleAutosave();
     }
 
     function inspectTileAtEvent(e) {
@@ -1010,6 +1096,14 @@
             `;
             list.appendChild(card);
         });
+
+        if (_pendingPaletteNames) {
+            _pendingPaletteNames.forEach((name, i) => {
+                const el = document.getElementById('nameInput-' + i);
+                if (el) el.value = name;
+            });
+            _pendingPaletteNames = null;
+        }
     }
 
     // --- FIX BAD TILES (reduce each to 4 colors) ---
@@ -1321,6 +1415,267 @@
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
     };
+
+    // --- SESSION PERSISTENCE (IndexedDB) ---
+
+    const DB_NAME = 'PaletteDetectiveDB';
+    const DB_VERSION = 1;
+    const STORE_NAME = 'session';
+    const SESSION_KEY = 'current';
+    const MAX_PERSIST_HISTORY = 5;
+    const AUTOSAVE_DELAY = 500;
+
+    let _autosaveTimer = null;
+    let _db = null;
+    let _persistenceReady = false;
+
+    function _openDB() {
+        return new Promise((resolve, reject) => {
+            try {
+                const req = indexedDB.open(DB_NAME, DB_VERSION);
+                req.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains(STORE_NAME)) {
+                        db.createObjectStore(STORE_NAME);
+                    }
+                };
+                req.onsuccess = (e) => {
+                    _db = e.target.result;
+                    _persistenceReady = true;
+                    resolve(_db);
+                };
+                req.onerror = () => reject(req.error);
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+
+    function _dbPut(key, value) {
+        if (!_db) return Promise.reject(new Error('DB not open'));
+        return new Promise((resolve, reject) => {
+            try {
+                const tx = _db.transaction(STORE_NAME, 'readwrite');
+                const store = tx.objectStore(STORE_NAME);
+                const req = store.put(value, key);
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+
+    function _dbGet(key) {
+        if (!_db) return Promise.resolve(null);
+        return new Promise((resolve, reject) => {
+            try {
+                const tx = _db.transaction(STORE_NAME, 'readonly');
+                const store = tx.objectStore(STORE_NAME);
+                const req = store.get(key);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => reject(req.error);
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+
+    function _dbDelete(key) {
+        if (!_db) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            try {
+                const tx = _db.transaction(STORE_NAME, 'readwrite');
+                const store = tx.objectStore(STORE_NAME);
+                const req = store.delete(key);
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+
+    function _serializeImageData(imgData) {
+        if (!imgData) return null;
+        return {
+            buffer: imgData.data.buffer.slice(0),
+            width: imgData.width,
+            height: imgData.height,
+        };
+    }
+
+    function _deserializeImageData(obj) {
+        if (!obj || !obj.buffer) return null;
+        try {
+            return new ImageData(
+                new Uint8ClampedArray(obj.buffer),
+                obj.width,
+                obj.height
+            );
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function _serializeSnapshot(snap) {
+        return {
+            imageDataURL: snap.imageDataURL,
+            palettes: snap.palettes,
+            tileMappings: snap.tileMappings,
+            paletteCounts: snap.paletteCounts,
+            errorTiles: snap.errorTiles,
+            baseImageData: _serializeImageData(snap.baseImageData),
+            settings: snap.settings,
+            activeHighlightIndex: snap.activeHighlightIndex,
+            currentZoom: snap.currentZoom,
+            btnDownloadFixedVisible: snap.btnDownloadFixedVisible,
+            imageInfoText: snap.imageInfoText,
+        };
+    }
+
+    function _deserializeSnapshot(obj) {
+        return {
+            imageDataURL: obj.imageDataURL,
+            palettes: obj.palettes || [],
+            tileMappings: obj.tileMappings || [],
+            paletteCounts: obj.paletteCounts || [],
+            errorTiles: obj.errorTiles || [],
+            baseImageData: _deserializeImageData(obj.baseImageData),
+            settings: obj.settings || { chkSnap: true, chkMergeBlack: true, chkGrid: true },
+            activeHighlightIndex: obj.activeHighlightIndex != null ? obj.activeHighlightIndex : -1,
+            currentZoom: obj.currentZoom || 1,
+            btnDownloadFixedVisible: !!obj.btnDownloadFixedVisible,
+            imageInfoText: obj.imageInfoText || '',
+        };
+    }
+
+    function _collectPaletteNames() {
+        const names = [];
+        for (let i = 0; i < globalDetectedPalettes.length; i++) {
+            const el = document.getElementById('nameInput-' + i);
+            names.push(el ? el.value : 'Detected Palette ' + (i + 1));
+        }
+        return names;
+    }
+
+    function _buildSessionData() {
+        return {
+            currentState: _serializeSnapshot(createSnapshot()),
+            undoStack: undoStack.slice(-MAX_PERSIST_HISTORY).map(_serializeSnapshot),
+            redoStack: redoStack.slice(-MAX_PERSIST_HISTORY).map(_serializeSnapshot),
+            paletteNames: _collectPaletteNames(),
+            timestamp: Date.now(),
+        };
+    }
+
+    function _flashAutosaveIndicator() {
+        const el = document.getElementById('autosaveIndicator');
+        if (!el) return;
+        el.classList.add('visible');
+        setTimeout(() => el.classList.remove('visible'), 1200);
+    }
+
+    function saveSession() {
+        if (!_persistenceReady) return Promise.resolve();
+        try {
+            const data = _buildSessionData();
+            return _dbPut(SESSION_KEY, data)
+                .then(_flashAutosaveIndicator)
+                .catch((err) => console.warn('Autosave failed:', err));
+        } catch (err) {
+            console.warn('Autosave build failed:', err);
+            return Promise.resolve();
+        }
+    }
+
+    function clearSession() {
+        return _dbDelete(SESSION_KEY).catch(() => {});
+    }
+
+    function scheduleAutosave() {
+        if (_autosaveTimer) clearTimeout(_autosaveTimer);
+        _autosaveTimer = setTimeout(() => {
+            _autosaveTimer = null;
+            saveSession();
+        }, AUTOSAVE_DELAY);
+    }
+
+    function _restoreFromSession(sessionData) {
+        try {
+            undoStack = (sessionData.undoStack || []).map(_deserializeSnapshot);
+            redoStack = (sessionData.redoStack || []).map(_deserializeSnapshot);
+            _pendingPaletteNames = sessionData.paletteNames || null;
+            restoreSnapshot(_deserializeSnapshot(sessionData.currentState));
+        } catch (err) {
+            console.warn('Session restore failed, starting fresh:', err);
+            undoStack = [];
+            redoStack = [];
+            _pendingPaletteNames = null;
+            clearSession();
+        }
+    }
+
+    function _showRestoreDialog(sessionData) {
+        const overlay = document.getElementById('restoreDialog');
+        const tsEl = document.getElementById('restoreTimestamp');
+        if (!overlay) return;
+
+        tsEl.textContent = sessionData.timestamp
+            ? new Date(sessionData.timestamp).toLocaleString()
+            : 'Unknown time';
+        overlay.style.display = 'flex';
+
+        document.getElementById('btnRestore').onclick = () => {
+            overlay.style.display = 'none';
+            _restoreFromSession(sessionData);
+        };
+        document.getElementById('btnDiscard').onclick = () => {
+            overlay.style.display = 'none';
+            clearSession();
+        };
+    }
+
+    (async function _initPersistence() {
+        let refreshMode = false;
+        try { refreshMode = localStorage.getItem('pd_refreshMode') === 'true'; } catch (e) {}
+        const chk = document.getElementById('chkRefreshMode');
+        if (chk) chk.checked = refreshMode;
+
+        try { await _openDB(); } catch (err) {
+            console.warn('IndexedDB unavailable, persistence disabled:', err);
+            return;
+        }
+
+        let session;
+        try { session = await _dbGet(SESSION_KEY); } catch (err) {
+            console.warn('Failed to read session:', err);
+            return;
+        }
+
+        if (!session || !session.currentState || !session.currentState.imageDataURL) return;
+
+        if (refreshMode) {
+            _restoreFromSession(session);
+        } else {
+            _showRestoreDialog(session);
+        }
+    })();
+
+    document.getElementById('chkRefreshMode').addEventListener('change', function () {
+        try { localStorage.setItem('pd_refreshMode', this.checked); } catch (e) {}
+        scheduleAutosave();
+    });
+
+    window.addEventListener('beforeunload', () => {
+        if (_autosaveTimer) {
+            clearTimeout(_autosaveTimer);
+            _autosaveTimer = null;
+        }
+        if (_persistenceReady) saveSession();
+    });
+
+    // --- END SESSION PERSISTENCE ---
 </script>
 
 </body>
