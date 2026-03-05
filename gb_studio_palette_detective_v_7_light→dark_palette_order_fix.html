@@ -297,6 +297,35 @@
         .dot { width: 10px; height: 10px; border-radius: 50%; }
 
         label { color: #fff; cursor: pointer; display: flex; align-items: center; gap: 8px; user-select: none;}
+
+        .history-controls {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            margin-left: auto;
+        }
+
+        .btn-history {
+            background: #444;
+            color: white;
+            border: 1px solid #555;
+            padding: 6px 14px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: background 0.2s, opacity 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .btn-history:hover:not(:disabled) { background: #555; }
+
+        .btn-history:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 <body>
@@ -318,6 +347,10 @@
             <input type="checkbox" id="chkGrid" checked onchange="reAnalyze()">
             Show Error Grid
         </label>
+        <div class="history-controls">
+            <button id="btnUndo" class="btn-history" onclick="undo()" disabled title="Nothing to undo">↩ Undo</button>
+            <button id="btnRedo" class="btn-history" onclick="redo()" disabled title="Nothing to redo">↪ Redo</button>
+        </div>
     </div>
 
     <div class="upload-section" onclick="document.getElementById('fileInput').click()">
@@ -399,6 +432,140 @@
     let lastErrorTiles = [];
     let lastBaseImageData = null; // ImageData from last analysis (before any highlight overlay)
 
+    // --- HISTORY SYSTEM ---
+    const MAX_HISTORY = 20;
+    let undoStack = [];
+    let redoStack = [];
+    let _restoreSeq = 0;
+
+    function createSnapshot() {
+        return {
+            imageDataURL: originalImage ? originalImage.src : null,
+            palettes: JSON.parse(JSON.stringify(globalDetectedPalettes)),
+            tileMappings: JSON.parse(JSON.stringify(globalTileMappings)),
+            paletteCounts: globalPaletteCounts.slice(),
+            errorTiles: JSON.parse(JSON.stringify(lastErrorTiles)),
+            baseImageData: lastBaseImageData
+                ? new ImageData(
+                      new Uint8ClampedArray(lastBaseImageData.data),
+                      lastBaseImageData.width,
+                      lastBaseImageData.height
+                  )
+                : null,
+            settings: {
+                chkSnap: document.getElementById('chkSnap').checked,
+                chkMergeBlack: document.getElementById('chkMergeBlack').checked,
+                chkGrid: document.getElementById('chkGrid').checked,
+            },
+            activeHighlightIndex: activeHighlightIndex,
+            currentZoom: currentZoom,
+            btnDownloadFixedVisible: document.getElementById('btnDownloadFixed').style.display !== 'none',
+            imageInfoText: imageInfo ? imageInfo.textContent : '',
+        };
+    }
+
+    function restoreSnapshot(snapshot) {
+        const seq = ++_restoreSeq;
+        document.getElementById('chkSnap').checked = snapshot.settings.chkSnap;
+        document.getElementById('chkMergeBlack').checked = snapshot.settings.chkMergeBlack;
+        document.getElementById('chkGrid').checked = snapshot.settings.chkGrid;
+
+        globalDetectedPalettes = snapshot.palettes;
+        globalTileMappings = snapshot.tileMappings;
+        globalPaletteCounts = snapshot.paletteCounts;
+        lastErrorTiles = snapshot.errorTiles;
+        activeHighlightIndex = snapshot.activeHighlightIndex;
+        currentZoom = snapshot.currentZoom;
+
+        document.getElementById('btnDownloadFixed').style.display =
+            snapshot.btnDownloadFixedVisible ? 'flex' : 'none';
+        tileInspector.style.display = 'none';
+
+        if (snapshot.imageDataURL) {
+            const img = new Image();
+            img.onload = () => {
+                if (seq !== _restoreSeq) return;
+                originalImage = img;
+                drawBaseImage();
+
+                if (snapshot.baseImageData) {
+                    lastBaseImageData = snapshot.baseImageData;
+                } else {
+                    lastBaseImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                }
+
+                if (snapshot.settings.chkGrid && lastErrorTiles.length > 0) {
+                    drawErrorOverlay(lastErrorTiles);
+                }
+
+                resultsArea.style.display = 'block';
+                if (imageInfo) {
+                    imageInfo.style.display = 'block';
+                    imageInfo.textContent = snapshot.imageInfoText;
+                }
+                if (zoomLabel) zoomLabel.style.display = 'block';
+                renderResults(globalDetectedPalettes, lastErrorTiles, globalPaletteCounts);
+                updateHistoryButtons();
+            };
+            img.src = snapshot.imageDataURL;
+        } else {
+            originalImage = null;
+            lastBaseImageData = null;
+            resultsArea.style.display = 'none';
+            updateHistoryButtons();
+        }
+    }
+
+    function applyAction(actionName, actionFn) {
+        const snapshot = createSnapshot();
+        undoStack.push(snapshot);
+        if (undoStack.length > MAX_HISTORY) {
+            undoStack.shift();
+        }
+        redoStack.length = 0;
+        actionFn();
+        updateHistoryButtons();
+    }
+
+    function undo() {
+        if (undoStack.length === 0) return;
+        redoStack.push(createSnapshot());
+        restoreSnapshot(undoStack.pop());
+    }
+
+    function redo() {
+        if (redoStack.length === 0) return;
+        undoStack.push(createSnapshot());
+        restoreSnapshot(redoStack.pop());
+    }
+
+    function updateHistoryButtons() {
+        const btnUndo = document.getElementById('btnUndo');
+        const btnRedo = document.getElementById('btnRedo');
+        btnUndo.disabled = undoStack.length === 0;
+        btnRedo.disabled = redoStack.length === 0;
+        btnUndo.title = undoStack.length > 0
+            ? 'Undo (' + undoStack.length + ') \u2014 Ctrl+Z'
+            : 'Nothing to undo';
+        btnRedo.title = redoStack.length > 0
+            ? 'Redo (' + redoStack.length + ') \u2014 Ctrl+Shift+Z'
+            : 'Nothing to redo';
+    }
+
+    document.addEventListener('keydown', (e) => {
+        const mod = (navigator.platform.toUpperCase().indexOf('MAC') >= 0) ? e.metaKey : e.ctrlKey;
+        if (!mod) return;
+
+        if (e.key === 'z' && !e.shiftKey) {
+            e.preventDefault();
+            undo();
+        } else if ((e.key === 'z' && e.shiftKey) || (e.key === 'y' && !e.shiftKey)) {
+            e.preventDefault();
+            redo();
+        }
+    });
+    // --- END HISTORY SYSTEM ---
+
     fileInput.addEventListener('change', handleFile);
 
     // Zoom Logic
@@ -449,19 +616,19 @@
         reader.onload = (event) => {
             const img = new Image();
             img.onload = () => {
-                originalImage = img;
-                activeHighlightIndex = -1;
-                // Reset zoom
-                currentZoom = 1;
+                applyAction('Load Image', () => {
+                    originalImage = img;
+                    activeHighlightIndex = -1;
+                    currentZoom = 1;
 
-                // Hide fixed download button on new load
-                document.getElementById('btnDownloadFixed').style.display = 'none';
-                document.getElementById('btnAutoMerge').style.display = 'none';
+                    document.getElementById('btnDownloadFixed').style.display = 'none';
+                    document.getElementById('btnAutoMerge').style.display = 'none';
 
-                resultsArea.style.display = 'block';
-                if (imageInfo) imageInfo.style.display = 'block';
-                if (zoomLabel) zoomLabel.style.display = 'block';
-                runAnalysis();
+                    resultsArea.style.display = 'block';
+                    if (imageInfo) imageInfo.style.display = 'block';
+                    if (zoomLabel) zoomLabel.style.display = 'block';
+                    runAnalysis();
+                });
             };
             img.src = event.target.result;
         };
@@ -850,61 +1017,63 @@
     function fixBadTiles() {
         if (lastErrorTiles.length === 0 || !originalImage) return;
 
-        const width = originalImage.width;
-        const height = originalImage.height;
-        drawBaseImage();
-        const imgData = ctx.getImageData(0, 0, width, height);
-        const data = imgData.data;
+        applyAction('Fix Bad Tiles', () => {
+            const width = originalImage.width;
+            const height = originalImage.height;
+            drawBaseImage();
+            const imgData = ctx.getImageData(0, 0, width, height);
+            const data = imgData.data;
 
-        lastErrorTiles.forEach(t => {
-            const colorCounts = new Map();
-            for (let dy = 0; dy < 8; dy++) {
-                for (let dx = 0; dx < 8; dx++) {
-                    const px = t.x + dx;
-                    const py = t.y + dy;
-                    if (px >= width || py >= height) continue;
-                    const idx = (py * width + px) * 4;
-                    if (data[idx + 3] < 128) continue;
-                    const hex = rgbToHex(data[idx], data[idx + 1], data[idx + 2]);
-                    colorCounts.set(hex, (colorCounts.get(hex) || 0) + 1);
+            lastErrorTiles.forEach(t => {
+                const colorCounts = new Map();
+                for (let dy = 0; dy < 8; dy++) {
+                    for (let dx = 0; dx < 8; dx++) {
+                        const px = t.x + dx;
+                        const py = t.y + dy;
+                        if (px >= width || py >= height) continue;
+                        const idx = (py * width + px) * 4;
+                        if (data[idx + 3] < 128) continue;
+                        const hex = rgbToHex(data[idx], data[idx + 1], data[idx + 2]);
+                        colorCounts.set(hex, (colorCounts.get(hex) || 0) + 1);
+                    }
                 }
-            }
-            const sorted = Array.from(colorCounts.entries()).sort((a, b) => b[1] - a[1]);
-            const top4 = sorted.slice(0, 4).map(e => e[0]);
-            while (top4.length < 4) top4.push("#000000");
+                const sorted = Array.from(colorCounts.entries()).sort((a, b) => b[1] - a[1]);
+                const top4 = sorted.slice(0, 4).map(e => e[0]);
+                while (top4.length < 4) top4.push("#000000");
 
-            for (let dy = 0; dy < 8; dy++) {
-                for (let dx = 0; dx < 8; dx++) {
-                    const px = t.x + dx;
-                    const py = t.y + dy;
-                    if (px >= width || py >= height) continue;
-                    const idx = (py * width + px) * 4;
-                    if (data[idx + 3] < 128) continue;
-                    const r = data[idx], g = data[idx + 1], b = data[idx + 2];
-                    let bestHex = top4[0];
-                    let bestDist = Infinity;
-                    top4.forEach(hex => {
-                        const [r2, g2, b2] = hexToRgb(hex);
-                        const d = colorDist(r, g, b, r2, g2, b2);
-                        if (d < bestDist) { bestDist = d; bestHex = hex; }
-                    });
-                    const [nr, ng, nb] = hexToRgb(bestHex);
-                    data[idx] = nr;
-                    data[idx + 1] = ng;
-                    data[idx + 2] = nb;
+                for (let dy = 0; dy < 8; dy++) {
+                    for (let dx = 0; dx < 8; dx++) {
+                        const px = t.x + dx;
+                        const py = t.y + dy;
+                        if (px >= width || py >= height) continue;
+                        const idx = (py * width + px) * 4;
+                        if (data[idx + 3] < 128) continue;
+                        const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+                        let bestHex = top4[0];
+                        let bestDist = Infinity;
+                        top4.forEach(hex => {
+                            const [r2, g2, b2] = hexToRgb(hex);
+                            const d = colorDist(r, g, b, r2, g2, b2);
+                            if (d < bestDist) { bestDist = d; bestHex = hex; }
+                        });
+                        const [nr, ng, nb] = hexToRgb(bestHex);
+                        data[idx] = nr;
+                        data[idx + 1] = ng;
+                        data[idx + 2] = nb;
+                    }
                 }
-            }
+            });
+
+            ctx.putImageData(imgData, 0, 0);
+            const newUrl = canvas.toDataURL();
+            const newImg = new Image();
+            newImg.onload = () => {
+                originalImage = newImg;
+                document.getElementById('btnDownloadFixed').style.display = 'flex';
+                runAnalysis();
+            };
+            newImg.src = newUrl;
         });
-
-        ctx.putImageData(imgData, 0, 0);
-        const newUrl = canvas.toDataURL();
-        const newImg = new Image();
-        newImg.onload = () => {
-            originalImage = newImg;
-            document.getElementById('btnDownloadFixed').style.display = 'flex';
-            runAnalysis();
-        };
-        newImg.src = newUrl;
     }
 
     // --- MATH MERGE LOGIC ---
@@ -912,24 +1081,25 @@
     function autoMergePalettes() {
         if(globalDetectedPalettes.length <= MAX_USER_PALETTES) return;
 
-        const btn = document.getElementById('btnAutoMerge');
-        const originalText = btn.textContent;
+        applyAction('Merge Palettes', () => {
+            const btn = document.getElementById('btnAutoMerge');
+            const originalText = btn.textContent;
 
-        try {
-            btn.textContent = "Processing... (Finding Closest Matches)";
-            btn.disabled = true;
+            try {
+                btn.textContent = "Processing... (Finding Closest Matches)";
+                btn.disabled = true;
 
-            // Small delay to let UI update
-            setTimeout(() => {
-                executeMerge(btn, originalText);
-            }, 50);
+                setTimeout(() => {
+                    executeMerge(btn, originalText);
+                }, 50);
 
-        } catch(e) {
-            console.error(e);
-            alert("Error running merge: " + e.message);
-            btn.textContent = originalText;
-            btn.disabled = false;
-        }
+            } catch(e) {
+                console.error(e);
+                alert("Error running merge: " + e.message);
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        });
     }
 
     function executeMerge(btn, originalText) {
