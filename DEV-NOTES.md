@@ -1,4 +1,4 @@
-# DEV-NOTES — Palette Detective History System
+# DEV-NOTES — Palette Detective History & Persistence
 
 ## Snapshot Structure
 
@@ -108,3 +108,118 @@ function myNewOperation() {
 - If your operation is asynchronous (e.g. builds a new `Image` from canvas), the snapshot is captured synchronously before any mutation begins, so async completion is safe.
 - Always call `runAnalysis()` after modifying pixel data so the palette list, tile mappings, and overlay stay in sync.
 - Keep destructive logic inside the callback passed to `applyAction`; do not mutate state before the wrapper call.
+
+---
+
+## Session Persistence
+
+Work is persisted to **IndexedDB** so that refreshing or closing the browser does not lose progress. `localStorage` is deliberately avoided because image blobs can easily exceed its ~5 MB quota.
+
+### Persistence Model
+
+| Item | IndexedDB key | Format |
+|------|---------------|--------|
+| Session metadata | `__meta__` | `{ activeProjectId, nextProjectNum, refreshMode }` |
+| Each project | `project_<id>` | Full project state (see below) |
+
+Each project record stores:
+
+```
+{
+  id, name,
+  imageBlob,              // Blob – the PNG/JPEG converted from the data-URL
+  palettes,               // deep-cloned palette arrays
+  tileMappings,           // deep-cloned tile mapping array
+  paletteCounts,          // shallow copy of per-palette tile counts
+  errorTiles,             // deep-cloned bad-tile list
+  settings,               // { chkSnap, chkMergeBlack, chkGrid }
+  activeHighlightIndex,
+  currentZoom,
+  btnDownloadFixedVisible,
+  imageInfoText,
+  undoStack,              // trimmed to last 5 entries (serialised)
+  redoStack,              // trimmed to last 5 entries (serialised)
+}
+```
+
+Images are stored as **Blob** objects (via `dataURLToBlob`), which IndexedDB handles natively and efficiently. On restore they are converted back to data-URLs with `blobToDataURL` so the existing `Image.src` loading path works unchanged.
+
+Undo/redo stack entries are serialised without `baseImageData` (an `ImageData` pixel buffer that can be several MB). On restore `baseImageData` is regenerated from the image by re-drawing and calling `ctx.getImageData`. Each stack is capped at 5 entries for persistence (`PERSIST_UNDO_LIMIT`); in-memory the runtime limit remains 20.
+
+### Autosave Flow
+
+```
+destructive operation
+        │
+        ▼
+  applyAction()  ──►  scheduleAutoSave()
+                            │
+                     500 ms debounce
+                            │
+                            ▼
+                     persistSession()
+                            │
+                   ┌────────┴────────┐
+                   │  saveCurrentProjectState()
+                   │  openDB()
+                   │  clear store
+                   │  write __meta__
+                   │  for each project:
+                   │    convert image → Blob
+                   │    trim undo/redo to 5
+                   │    serialize & store
+                   │  await tx.oncomplete
+                   │  mark all projects clean
+                   │  flash "Session saved" badge
+                   └─────────────────┘
+```
+
+Every `applyAction`, `switchToProject`, `newProject`, `closeProject`, and file upload triggers `scheduleAutoSave()`, which debounces at **500 ms**. A 30-second interval also catches any missed saves.
+
+On `beforeunload`, a fire-and-forget `persistSession()` runs as a last resort.
+
+### Restore Logic
+
+```
+initApp()
+    │
+    ▼
+checkSavedSession()
+    │
+    ├── null → startFreshSession()
+    │
+    └── sessionData found
+            │
+            ├── refreshMode ON  → auto-restore
+            │
+            └── refreshMode OFF → show dialog
+                    │
+                    ├── "Restore"  → applyRestoredSession()
+                    │                    ├── success → continue
+                    │                    └── failure → clearSavedSession() → startFreshSession()
+                    │
+                    └── "Discard"  → clearSavedSession() → startFreshSession()
+```
+
+The restore dialog is a fixed-position overlay with **Restore** / **Discard** buttons. It is shown only when:
+1. A saved session exists in IndexedDB, AND
+2. The "Refresh Mode" checkbox was **not** enabled.
+
+### Refresh Mode
+
+A **Refresh Mode** checkbox in the control bar, when enabled:
+- Persists its state to the `__meta__` record in IndexedDB.
+- On next page load, skips the restore dialog and **automatically** restores the previous session.
+
+### Failure Safety
+
+All IndexedDB operations are wrapped in `try/catch`. Specific failure scenarios:
+
+| Scenario | Behaviour |
+|----------|-----------|
+| `indexedDB.open` fails or is blocked | `checkSavedSession` returns `null` → fresh session |
+| Corrupt/unreadable records | `applyRestoredSession` catches, returns `false` → clears DB, fresh session |
+| Image blob conversion fails | That project's image is set to `null`; other data still restores |
+| `persistSession` fails | Warning logged; dirty flags remain so next interval retries |
+
+No alert dialogs are shown on failure; the app silently falls back to a new session.
