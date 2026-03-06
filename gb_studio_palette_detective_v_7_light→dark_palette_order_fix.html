@@ -33,7 +33,7 @@
             max-width: 1000px;
             background-color: var(--surface);
             padding: 2rem;
-            border-radius: 12px;
+            border-radius: 0 0 12px 12px;
             box-shadow: 0 8px 32px rgba(0,0,0,0.3);
         }
 
@@ -326,9 +326,97 @@
             opacity: 0.35;
             cursor: not-allowed;
         }
+
+        .tab-bar {
+            display: flex;
+            align-items: flex-end;
+            width: 100%;
+            max-width: 1000px;
+            padding: 6px 2rem 0;
+            gap: 2px;
+            background: #232323;
+            border-radius: 12px 12px 0 0;
+            box-sizing: content-box;
+            overflow-x: auto;
+            overflow-y: hidden;
+            scrollbar-width: thin;
+            scrollbar-color: #555 transparent;
+        }
+        .tab-bar::-webkit-scrollbar { height: 4px; }
+        .tab-bar::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
+
+        .tab {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 7px 12px;
+            background: transparent;
+            border: none;
+            border-radius: 6px 6px 0 0;
+            color: #888;
+            cursor: pointer;
+            font-size: 0.82rem;
+            white-space: nowrap;
+            max-width: 200px;
+            min-width: 0;
+            flex-shrink: 0;
+            user-select: none;
+            transition: background 0.15s, color 0.15s;
+        }
+        .tab:hover { background: rgba(255,255,255,0.06); color: #ccc; }
+        .tab.active {
+            background: var(--surface);
+            color: #fff;
+            padding-bottom: 8px;
+            margin-bottom: -1px;
+            z-index: 1;
+        }
+        .tab-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .tab-dirty {
+            color: var(--warning);
+            font-size: 0.6rem;
+            flex-shrink: 0;
+            line-height: 1;
+        }
+        .tab-close {
+            background: none;
+            border: none;
+            color: #666;
+            cursor: pointer;
+            font-size: 0.85rem;
+            padding: 0 2px;
+            line-height: 1;
+            flex-shrink: 0;
+            border-radius: 3px;
+            transition: color 0.15s, background 0.15s;
+        }
+        .tab-close:hover { color: var(--danger); background: rgba(255,68,68,0.15); }
+        .tab.active .tab-close { color: #999; }
+        .tab-new {
+            background: none;
+            border: 1px dashed #555;
+            border-bottom: none;
+            color: #777;
+            cursor: pointer;
+            font-size: 1.1rem;
+            padding: 5px 14px;
+            border-radius: 6px 6px 0 0;
+            flex-shrink: 0;
+            transition: color 0.15s, border-color 0.15s;
+            margin-left: 4px;
+        }
+        .tab-new:hover { color: var(--primary); border-color: var(--primary); }
     </style>
 </head>
 <body>
+
+<div class="tab-bar" id="tabBar">
+    <div id="tabList" style="display:contents;"></div>
+    <button class="tab-new" id="btnNewProject" onclick="newProject()" title="New Project (Ctrl+T)">+</button>
+</div>
 
 <div class="container">
     <h1>🎨 Palette Detective v7</h1>
@@ -354,8 +442,8 @@
     </div>
 
     <div class="upload-section" onclick="document.getElementById('fileInput').click()">
-        <input type="file" id="fileInput" accept="image/png, image/jpeg">
-        <button class="btn-upload">Choose Image File</button>
+        <input type="file" id="fileInput" accept="image/png, image/jpeg" multiple>
+        <button class="btn-upload">Choose Image File(s)</button>
     </div>
 
     <div id="resultsArea">
@@ -431,6 +519,171 @@
     let activeHighlightIndex = -1;
     let lastErrorTiles = [];
     let lastBaseImageData = null; // ImageData from last analysis (before any highlight overlay)
+
+    // --- PROJECT MANAGEMENT ---
+    let projects = [];
+    let activeProjectId = null;
+    let _nextProjectNum = 1;
+    let _autoSaveTimer = null;
+    const AUTOSAVE_DELAY = 3000;
+
+    function generateProjectId() {
+        return 'p' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    }
+
+    function createNewProject(name) {
+        return {
+            id: generateProjectId(),
+            name: name || ('Untitled ' + (_nextProjectNum++)),
+            imageDataURL: null,
+            palettes: [],
+            tileMappings: [],
+            paletteCounts: [],
+            errorTiles: [],
+            baseImageData: null,
+            currentZoom: 1,
+            activeHighlightIndex: -1,
+            settings: { chkSnap: true, chkMergeBlack: true, chkGrid: true },
+            undoStack: [],
+            redoStack: [],
+            btnDownloadFixedVisible: false,
+            imageInfoText: '',
+            dirty: false,
+        };
+    }
+
+    function getActiveProject() {
+        return projects.find(p => p.id === activeProjectId) || null;
+    }
+
+    function saveCurrentProjectState() {
+        const proj = getActiveProject();
+        if (!proj) return;
+        proj.imageDataURL = originalImage ? originalImage.src : null;
+        proj.palettes = globalDetectedPalettes;
+        proj.tileMappings = globalTileMappings;
+        proj.paletteCounts = globalPaletteCounts;
+        proj.errorTiles = lastErrorTiles;
+        proj.baseImageData = lastBaseImageData;
+        proj.currentZoom = currentZoom;
+        proj.activeHighlightIndex = activeHighlightIndex;
+        proj.settings = {
+            chkSnap: document.getElementById('chkSnap').checked,
+            chkMergeBlack: document.getElementById('chkMergeBlack').checked,
+            chkGrid: document.getElementById('chkGrid').checked,
+        };
+        proj.undoStack = undoStack;
+        proj.redoStack = redoStack;
+        proj.btnDownloadFixedVisible = document.getElementById('btnDownloadFixed').style.display !== 'none';
+        proj.imageInfoText = imageInfo ? imageInfo.textContent : '';
+    }
+
+    function switchToProject(targetId) {
+        if (activeProjectId === targetId) {
+            renderTabs();
+            return;
+        }
+        saveCurrentProjectState();
+
+        const proj = projects.find(p => p.id === targetId);
+        if (!proj) return;
+
+        activeProjectId = targetId;
+
+        document.getElementById('chkSnap').checked = proj.settings.chkSnap;
+        document.getElementById('chkMergeBlack').checked = proj.settings.chkMergeBlack;
+        document.getElementById('chkGrid').checked = proj.settings.chkGrid;
+
+        globalDetectedPalettes = proj.palettes || [];
+        globalTileMappings = proj.tileMappings || [];
+        globalPaletteCounts = proj.paletteCounts || [];
+        lastErrorTiles = proj.errorTiles || [];
+        lastBaseImageData = proj.baseImageData || null;
+        currentZoom = proj.currentZoom || 1;
+        activeHighlightIndex = proj.activeHighlightIndex != null ? proj.activeHighlightIndex : -1;
+        undoStack = proj.undoStack || [];
+        redoStack = proj.redoStack || [];
+
+        document.getElementById('btnDownloadFixed').style.display = proj.btnDownloadFixedVisible ? 'flex' : 'none';
+        document.getElementById('btnAutoMerge').style.display = 'none';
+        document.getElementById('btnFixBadTiles').style.display = 'none';
+        tileInspector.style.display = 'none';
+
+        if (proj.imageDataURL) {
+            const seq = ++_restoreSeq;
+            const img = new Image();
+            img.onload = () => {
+                if (seq !== _restoreSeq) return;
+                originalImage = img;
+                drawBaseImage();
+                if (proj.baseImageData) {
+                    lastBaseImageData = proj.baseImageData;
+                } else {
+                    lastBaseImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                }
+                if (globalDetectedPalettes.length === 0) {
+                    runAnalysis();
+                } else {
+                    if (document.getElementById('chkGrid').checked && lastErrorTiles.length > 0) {
+                        drawErrorOverlay(lastErrorTiles);
+                    }
+                    renderResults(globalDetectedPalettes, lastErrorTiles, globalPaletteCounts);
+                }
+                resultsArea.style.display = 'block';
+                if (imageInfo) {
+                    imageInfo.style.display = 'block';
+                    imageInfo.textContent = proj.imageInfoText || '';
+                }
+                if (zoomLabel) zoomLabel.style.display = 'block';
+                updateHistoryButtons();
+            };
+            img.src = proj.imageDataURL;
+        } else {
+            originalImage = null;
+            lastBaseImageData = null;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            resultsArea.style.display = 'none';
+            if (imageInfo) imageInfo.style.display = 'none';
+            if (zoomLabel) zoomLabel.style.display = 'none';
+            updateHistoryButtons();
+        }
+
+        renderTabs();
+        scheduleAutoSave();
+    }
+
+    function newProject() {
+        saveCurrentProjectState();
+        const proj = createNewProject();
+        projects.push(proj);
+        switchToProject(proj.id);
+        scheduleAutoSave();
+    }
+
+    function closeProject(id) {
+        const proj = projects.find(p => p.id === id);
+        if (!proj) return;
+
+        if (proj.dirty) {
+            if (!confirm('"' + proj.name + '" has unsaved changes. Close anyway?')) return;
+        }
+
+        const idx = projects.indexOf(proj);
+        projects.splice(idx, 1);
+
+        if (projects.length === 0) {
+            const np = createNewProject();
+            projects.push(np);
+            switchToProject(np.id);
+        } else if (activeProjectId === id) {
+            const newIdx = Math.min(idx, projects.length - 1);
+            switchToProject(projects[newIdx].id);
+        } else {
+            renderTabs();
+        }
+        scheduleAutoSave();
+    }
 
     // --- HISTORY SYSTEM ---
     const MAX_HISTORY = 20;
@@ -525,6 +778,10 @@
         redoStack.length = 0;
         actionFn();
         updateHistoryButtons();
+        const proj = getActiveProject();
+        if (proj) proj.dirty = true;
+        renderTabs();
+        scheduleAutoSave();
     }
 
     function undo() {
@@ -562,6 +819,12 @@
         } else if ((e.key === 'z' && e.shiftKey) || (e.key === 'y' && !e.shiftKey)) {
             e.preventDefault();
             redo();
+        } else if (e.key === 't') {
+            e.preventDefault();
+            newProject();
+        } else if (e.key === 'w') {
+            e.preventDefault();
+            if (activeProjectId) closeProject(activeProjectId);
         }
     });
     // --- END HISTORY SYSTEM ---
@@ -609,30 +872,76 @@
     });
 
     function handleFile(e) {
-        const file = e.target.files[0];
-        if(!file) return;
+        const files = Array.from(e.target.files || []);
+        if (files.length === 0) return;
 
-        const reader = new FileReader();
-        reader.onload = (event) => {
-            const img = new Image();
-            img.onload = () => {
-                applyAction('Load Image', () => {
-                    originalImage = img;
-                    activeHighlightIndex = -1;
-                    currentZoom = 1;
+        const results = new Array(files.length);
+        let completed = 0;
 
-                    document.getElementById('btnDownloadFixed').style.display = 'none';
-                    document.getElementById('btnAutoMerge').style.display = 'none';
-
-                    resultsArea.style.display = 'block';
-                    if (imageInfo) imageInfo.style.display = 'block';
-                    if (zoomLabel) zoomLabel.style.display = 'block';
-                    runAnalysis();
-                });
+        files.forEach((file, idx) => {
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                results[idx] = {
+                    name: file.name.replace(/\.[^/.]+$/, ''),
+                    dataURL: event.target.result,
+                };
+                completed++;
+                if (completed === files.length) {
+                    processUploadedFiles(results);
+                }
             };
-            img.src = event.target.result;
-        };
-        reader.readAsDataURL(file);
+            reader.readAsDataURL(file);
+        });
+
+        if (e.target && e.target.value !== undefined) {
+            try { e.target.value = ''; } catch(_) {}
+        }
+    }
+
+    function processUploadedFiles(results) {
+        let lastNewProjectId = null;
+        let reusedCurrent = false;
+
+        results.forEach((result, idx) => {
+            const activeProj = getActiveProject();
+            const reuseEmpty = idx === 0 && activeProj && !activeProj.imageDataURL && !originalImage;
+
+            if (reuseEmpty) {
+                activeProj.name = result.name;
+                activeProj.imageDataURL = result.dataURL;
+                activeProj.dirty = true;
+                reusedCurrent = true;
+                const img = new Image();
+                img.onload = () => {
+                    applyAction('Load Image', () => {
+                        originalImage = img;
+                        activeHighlightIndex = -1;
+                        currentZoom = 1;
+                        document.getElementById('btnDownloadFixed').style.display = 'none';
+                        document.getElementById('btnAutoMerge').style.display = 'none';
+                        resultsArea.style.display = 'block';
+                        if (imageInfo) imageInfo.style.display = 'block';
+                        if (zoomLabel) zoomLabel.style.display = 'block';
+                        runAnalysis();
+                    });
+                    renderTabs();
+                };
+                img.src = result.dataURL;
+            } else {
+                saveCurrentProjectState();
+                const proj = createNewProject(result.name);
+                proj.imageDataURL = result.dataURL;
+                proj.dirty = true;
+                projects.push(proj);
+                lastNewProjectId = proj.id;
+            }
+        });
+
+        renderTabs();
+        if (lastNewProjectId) {
+            switchToProject(lastNewProjectId);
+        }
+        scheduleAutoSave();
     }
 
     function reAnalyze() {
@@ -1321,6 +1630,203 @@
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
     };
+
+    // --- TAB RENDERING ---
+    function renderTabs() {
+        const tabList = document.getElementById('tabList');
+        if (!tabList) return;
+        tabList.innerHTML = '';
+
+        projects.forEach(proj => {
+            const tab = document.createElement('div');
+            tab.className = 'tab' + (proj.id === activeProjectId ? ' active' : '');
+            tab.onclick = (e) => {
+                if (!e.target.closest('.tab-close')) {
+                    switchToProject(proj.id);
+                }
+            };
+
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'tab-name';
+            nameSpan.textContent = proj.name;
+            nameSpan.title = proj.name;
+            tab.appendChild(nameSpan);
+
+            if (proj.dirty) {
+                const dot = document.createElement('span');
+                dot.className = 'tab-dirty';
+                dot.textContent = '\u25CF';
+                dot.title = 'Unsaved changes';
+                tab.appendChild(dot);
+            }
+
+            const closeBtn = document.createElement('button');
+            closeBtn.className = 'tab-close';
+            closeBtn.innerHTML = '&times;';
+            closeBtn.title = 'Close project (Ctrl+W)';
+            closeBtn.onclick = (e) => {
+                e.stopPropagation();
+                closeProject(proj.id);
+            };
+            tab.appendChild(closeBtn);
+
+            tabList.appendChild(tab);
+        });
+    }
+
+    // --- PERSISTENCE (IndexedDB) ---
+    const DB_NAME = 'PaletteDetectiveDB';
+    const DB_VERSION = 1;
+    const STORE_NAME = 'data';
+
+    function openDB() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(DB_NAME, DB_VERSION);
+            req.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains(STORE_NAME)) {
+                    db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function persistSession() {
+        try {
+            saveCurrentProjectState();
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            const store = tx.objectStore(STORE_NAME);
+
+            store.clear();
+
+            store.put({
+                key: '__meta__',
+                activeProjectId: activeProjectId,
+                nextProjectNum: _nextProjectNum,
+            });
+
+            for (const proj of projects) {
+                const imgURL = (proj.id === activeProjectId && originalImage)
+                    ? originalImage.src
+                    : proj.imageDataURL;
+                store.put({
+                    key: 'project_' + proj.id,
+                    id: proj.id,
+                    name: proj.name,
+                    imageDataURL: imgURL || null,
+                    settings: proj.settings,
+                });
+            }
+
+            await new Promise((resolve, reject) => {
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+            });
+
+            projects.forEach(p => p.dirty = false);
+            renderTabs();
+        } catch (e) {
+            console.warn('Persist failed:', e);
+        }
+    }
+
+    async function restoreSession() {
+        try {
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const store = tx.objectStore(STORE_NAME);
+            const all = await new Promise((resolve, reject) => {
+                const req = store.getAll();
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+
+            const meta = all.find(r => r.key === '__meta__');
+            if (!meta) return false;
+
+            const recs = all.filter(r => r.key.startsWith('project_'));
+            if (recs.length === 0) return false;
+
+            _nextProjectNum = meta.nextProjectNum || 1;
+
+            for (const rec of recs) {
+                const proj = createNewProject(rec.name);
+                proj.id = rec.id;
+                proj.settings = rec.settings || { chkSnap: true, chkMergeBlack: true, chkGrid: true };
+                proj.imageDataURL = rec.imageDataURL || null;
+                projects.push(proj);
+            }
+
+            _nextProjectNum = meta.nextProjectNum || _nextProjectNum;
+
+            const activeId = meta.activeProjectId;
+            const activeProj = projects.find(p => p.id === activeId) || projects[0];
+
+            activeProjectId = activeProj.id;
+
+            document.getElementById('chkSnap').checked = activeProj.settings.chkSnap;
+            document.getElementById('chkMergeBlack').checked = activeProj.settings.chkMergeBlack;
+            document.getElementById('chkGrid').checked = activeProj.settings.chkGrid;
+
+            undoStack = activeProj.undoStack;
+            redoStack = activeProj.redoStack;
+
+            if (activeProj.imageDataURL) {
+                const seq = ++_restoreSeq;
+                const img = new Image();
+                img.onload = () => {
+                    if (seq !== _restoreSeq) return;
+                    originalImage = img;
+                    drawBaseImage();
+                    lastBaseImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    resultsArea.style.display = 'block';
+                    if (imageInfo) imageInfo.style.display = 'block';
+                    if (zoomLabel) zoomLabel.style.display = 'block';
+                    runAnalysis();
+                    updateHistoryButtons();
+                };
+                img.src = activeProj.imageDataURL;
+            }
+
+            renderTabs();
+            return true;
+        } catch (e) {
+            console.warn('Restore failed:', e);
+            return false;
+        }
+    }
+
+    function scheduleAutoSave() {
+        if (_autoSaveTimer) clearTimeout(_autoSaveTimer);
+        _autoSaveTimer = setTimeout(() => { persistSession(); }, AUTOSAVE_DELAY);
+    }
+
+    // --- CLOSE PROTECTION ---
+    window.addEventListener('beforeunload', (e) => {
+        if (projects.some(p => p.dirty)) {
+            e.preventDefault();
+            e.returnValue = '';
+        }
+    });
+
+    // --- INITIALIZATION ---
+    (async function initApp() {
+        const restored = await restoreSession();
+        if (!restored) {
+            const proj = createNewProject();
+            projects.push(proj);
+            activeProjectId = proj.id;
+            undoStack = proj.undoStack;
+            redoStack = proj.redoStack;
+            renderTabs();
+        }
+        setInterval(() => {
+            if (projects.some(p => p.dirty)) persistSession();
+        }, 30000);
+    })();
 </script>
 
 </body>
