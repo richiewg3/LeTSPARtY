@@ -75,6 +75,66 @@
             cursor: pointer;
         }
 
+        .upload-divider {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 16px 0 0;
+            color: #888;
+            font-size: 0.85rem;
+            pointer-events: none;
+        }
+        .upload-divider::before,
+        .upload-divider::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+
+        .url-input-row {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+            pointer-events: auto;
+        }
+        .url-input-row input[type="text"] {
+            flex: 1;
+            padding: 9px 12px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            background: #222;
+            color: var(--text);
+            font-size: 0.9rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .url-input-row input[type="text"]:focus {
+            border-color: var(--primary);
+        }
+        .url-input-row input[type="text"]::placeholder {
+            color: #666;
+        }
+        .btn-url-load {
+            background: var(--primary);
+            color: white;
+            padding: 9px 18px;
+            border-radius: 4px;
+            border: none;
+            font-weight: bold;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: opacity 0.2s;
+        }
+        .btn-url-load:hover { opacity: 0.85; }
+        .btn-url-load:disabled { opacity: 0.5; cursor: not-allowed; }
+        .url-error {
+            color: var(--danger);
+            font-size: 0.8rem;
+            margin-top: 6px;
+            min-height: 1.2em;
+        }
+
         #resultsArea { display: none; }
 
         .stat-box {
@@ -720,6 +780,12 @@
     <div class="upload-section" onclick="document.getElementById('fileInput').click()">
         <input type="file" id="fileInput" accept="image/png, image/jpeg" multiple>
         <button class="btn-upload">Choose Image File(s)</button>
+        <div class="upload-divider">or paste a URL</div>
+        <div class="url-input-row" onclick="event.stopPropagation()">
+            <input type="text" id="urlInput" placeholder="https://example.com/image.png" />
+            <button class="btn-url-load" id="btnUrlLoad" onclick="loadImageFromURL()">Load</button>
+        </div>
+        <div class="url-error" id="urlError"></div>
     </div>
 
     <div id="resultsArea">
@@ -1258,6 +1324,69 @@
             try { e.target.value = ''; } catch(_) {}
         }
     }
+
+    function loadImageFromURL() {
+        const urlInput = document.getElementById('urlInput');
+        const urlError = document.getElementById('urlError');
+        const btnLoad  = document.getElementById('btnUrlLoad');
+        const rawURL   = urlInput.value.trim();
+        urlError.textContent = '';
+
+        if (!rawURL) {
+            urlError.textContent = 'Please enter an image URL.';
+            return;
+        }
+
+        let parsed;
+        try { parsed = new URL(rawURL); } catch (_) {
+            urlError.textContent = 'Invalid URL format.';
+            return;
+        }
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+            urlError.textContent = 'Only http and https URLs are supported.';
+            return;
+        }
+
+        btnLoad.disabled = true;
+        btnLoad.textContent = 'Loading…';
+
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+
+        img.onload = () => {
+            const c = document.createElement('canvas');
+            c.width = img.width;
+            c.height = img.height;
+            c.getContext('2d').drawImage(img, 0, 0);
+            let dataURL;
+            try {
+                dataURL = c.toDataURL('image/png');
+            } catch (e) {
+                urlError.textContent = 'Could not read image (CORS blocked). Try downloading the file first.';
+                btnLoad.disabled = false;
+                btnLoad.textContent = 'Load';
+                return;
+            }
+
+            const namePart = parsed.pathname.split('/').pop().replace(/\.[^/.]+$/, '') || 'url-image';
+            processUploadedFiles([{ name: decodeURIComponent(namePart), dataURL }]);
+            urlInput.value = '';
+            btnLoad.disabled = false;
+            btnLoad.textContent = 'Load';
+        };
+
+        img.onerror = () => {
+            urlError.textContent = 'Failed to load image. Check the URL and make sure it points to a valid image.';
+            btnLoad.disabled = false;
+            btnLoad.textContent = 'Load';
+        };
+
+        img.src = rawURL;
+    }
+
+    document.getElementById('urlInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); loadImageFromURL(); }
+    });
 
     function processUploadedFiles(results) {
         let lastNewProjectId = null;
