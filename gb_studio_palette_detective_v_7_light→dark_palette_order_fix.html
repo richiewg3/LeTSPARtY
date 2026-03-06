@@ -409,6 +409,68 @@
             margin-left: 4px;
         }
         .tab-new:hover { color: var(--primary); border-color: var(--primary); }
+
+        .restore-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.75);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+        .restore-modal {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 2rem 2.5rem;
+            max-width: 420px;
+            text-align: center;
+            box-shadow: 0 12px 48px rgba(0,0,0,0.5);
+        }
+        .restore-modal h2 { margin-top: 0; font-size: 1.3rem; }
+        .restore-modal p { color: #bbb; margin-bottom: 1.5rem; font-size: 0.95rem; }
+        .restore-modal .restore-actions { display: flex; gap: 12px; justify-content: center; }
+        .restore-modal .btn-restore {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 10px 28px;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: filter 0.15s;
+        }
+        .restore-modal .btn-restore:hover { filter: brightness(1.15); }
+        .restore-modal .btn-discard {
+            background: #555;
+            color: white;
+            border: none;
+            padding: 10px 28px;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background 0.15s;
+        }
+        .restore-modal .btn-discard:hover { background: var(--danger); }
+
+        .persist-badge {
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            background: rgba(0,200,81,0.15);
+            color: var(--success);
+            padding: 6px 14px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+            z-index: 100;
+        }
+        .persist-badge.show { opacity: 1; }
     </style>
 </head>
 <body>
@@ -434,6 +496,10 @@
         <label>
             <input type="checkbox" id="chkGrid" checked onchange="reAnalyze()">
             Show Error Grid
+        </label>
+        <label title="Skip restore dialog on refresh and auto-restore session">
+            <input type="checkbox" id="chkRefreshMode" onchange="scheduleAutoSave()">
+            <strong>Refresh Mode</strong>
         </label>
         <div class="history-controls">
             <button id="btnUndo" class="btn-history" onclick="undo()" disabled title="Nothing to undo">↩ Undo</button>
@@ -496,6 +562,18 @@
     </div>
 </div>
 
+<div id="restoreDialog" class="restore-overlay" style="display:none;">
+    <div class="restore-modal">
+        <h2>Restore Previous Session?</h2>
+        <p>A saved session was found. Your previous work can be restored.</p>
+        <div class="restore-actions">
+            <button class="btn-restore" onclick="confirmRestore(true)">Restore</button>
+            <button class="btn-discard" onclick="confirmRestore(false)">Discard</button>
+        </div>
+    </div>
+</div>
+<div id="persistBadge" class="persist-badge">Session saved</div>
+
 <script>
     const fileInput = document.getElementById('fileInput');
     const resultsArea = document.getElementById('resultsArea');
@@ -525,7 +603,7 @@
     let activeProjectId = null;
     let _nextProjectNum = 1;
     let _autoSaveTimer = null;
-    const AUTOSAVE_DELAY = 3000;
+    const AUTOSAVE_DELAY = 500;
 
     function generateProjectId() {
         return 'p' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
@@ -1676,21 +1754,85 @@
 
     // --- PERSISTENCE (IndexedDB) ---
     const DB_NAME = 'PaletteDetectiveDB';
-    const DB_VERSION = 1;
+    const DB_VERSION = 2;
     const STORE_NAME = 'data';
+    const PERSIST_UNDO_LIMIT = 5;
 
     function openDB() {
         return new Promise((resolve, reject) => {
-            const req = indexedDB.open(DB_NAME, DB_VERSION);
-            req.onupgradeneeded = (e) => {
-                const db = e.target.result;
-                if (!db.objectStoreNames.contains(STORE_NAME)) {
+            try {
+                const req = indexedDB.open(DB_NAME, DB_VERSION);
+                req.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (db.objectStoreNames.contains(STORE_NAME)) {
+                        db.deleteObjectStore(STORE_NAME);
+                    }
                     db.createObjectStore(STORE_NAME, { keyPath: 'key' });
-                }
-            };
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
+                };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+                req.onblocked = () => reject(new Error('IndexedDB blocked'));
+            } catch (e) {
+                reject(e);
+            }
         });
+    }
+
+    function dataURLToBlob(dataURL) {
+        const parts = dataURL.split(',');
+        const mime = parts[0].match(/:(.*?);/)[1];
+        const binary = atob(parts[1]);
+        const array = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) array[i] = binary.charCodeAt(i);
+        return new Blob([array], { type: mime });
+    }
+
+    function blobToDataURL(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    function serializeSnapshot(snap) {
+        return {
+            imageDataURL: snap.imageDataURL || null,
+            palettes: snap.palettes,
+            tileMappings: snap.tileMappings,
+            paletteCounts: snap.paletteCounts,
+            errorTiles: snap.errorTiles,
+            settings: snap.settings,
+            activeHighlightIndex: snap.activeHighlightIndex,
+            currentZoom: snap.currentZoom,
+            btnDownloadFixedVisible: snap.btnDownloadFixedVisible,
+            imageInfoText: snap.imageInfoText || '',
+        };
+    }
+
+    function deserializeSnapshot(data) {
+        return {
+            imageDataURL: data.imageDataURL || null,
+            palettes: data.palettes || [],
+            tileMappings: data.tileMappings || [],
+            paletteCounts: data.paletteCounts || [],
+            errorTiles: data.errorTiles || [],
+            baseImageData: null,
+            settings: data.settings || { chkSnap: true, chkMergeBlack: true, chkGrid: true },
+            activeHighlightIndex: data.activeHighlightIndex != null ? data.activeHighlightIndex : -1,
+            currentZoom: data.currentZoom || 1,
+            btnDownloadFixedVisible: data.btnDownloadFixedVisible || false,
+            imageInfoText: data.imageInfoText || '',
+        };
+    }
+
+    function flashPersistBadge() {
+        const badge = document.getElementById('persistBadge');
+        if (!badge) return;
+        badge.classList.add('show');
+        clearTimeout(badge._hideTimer);
+        badge._hideTimer = setTimeout(() => badge.classList.remove('show'), 1200);
     }
 
     async function persistSession() {
@@ -1706,18 +1848,39 @@
                 key: '__meta__',
                 activeProjectId: activeProjectId,
                 nextProjectNum: _nextProjectNum,
+                refreshMode: document.getElementById('chkRefreshMode').checked,
             });
 
             for (const proj of projects) {
                 const imgURL = (proj.id === activeProjectId && originalImage)
                     ? originalImage.src
                     : proj.imageDataURL;
+
+                let imageBlob = null;
+                if (imgURL && imgURL.startsWith('data:')) {
+                    try { imageBlob = dataURLToBlob(imgURL); }
+                    catch (_) { imageBlob = null; }
+                }
+
+                const trimmedUndo = (proj.undoStack || []).slice(-PERSIST_UNDO_LIMIT).map(serializeSnapshot);
+                const trimmedRedo = (proj.redoStack || []).slice(-PERSIST_UNDO_LIMIT).map(serializeSnapshot);
+
                 store.put({
                     key: 'project_' + proj.id,
                     id: proj.id,
                     name: proj.name,
-                    imageDataURL: imgURL || null,
+                    imageBlob: imageBlob,
+                    palettes: JSON.parse(JSON.stringify(proj.palettes || [])),
+                    tileMappings: JSON.parse(JSON.stringify(proj.tileMappings || [])),
+                    paletteCounts: (proj.paletteCounts || []).slice(),
+                    errorTiles: JSON.parse(JSON.stringify(proj.errorTiles || [])),
                     settings: proj.settings,
+                    activeHighlightIndex: proj.activeHighlightIndex,
+                    currentZoom: proj.currentZoom || 1,
+                    btnDownloadFixedVisible: proj.btnDownloadFixedVisible || false,
+                    imageInfoText: proj.imageInfoText || '',
+                    undoStack: trimmedUndo,
+                    redoStack: trimmedRedo,
                 });
             }
 
@@ -1728,12 +1891,13 @@
 
             projects.forEach(p => p.dirty = false);
             renderTabs();
+            flashPersistBadge();
         } catch (e) {
             console.warn('Persist failed:', e);
         }
     }
 
-    async function restoreSession() {
+    async function checkSavedSession() {
         try {
             const db = await openDB();
             const tx = db.transaction(STORE_NAME, 'readonly');
@@ -1745,26 +1909,58 @@
             });
 
             const meta = all.find(r => r.key === '__meta__');
-            if (!meta) return false;
+            if (!meta) return null;
 
             const recs = all.filter(r => r.key.startsWith('project_'));
-            if (recs.length === 0) return false;
+            if (recs.length === 0) return null;
 
+            const hasContent = recs.some(r =>
+                r.imageBlob || (r.palettes && r.palettes.length > 0)
+            );
+            if (!hasContent) return null;
+
+            return { meta, recs };
+        } catch (e) {
+            console.warn('Session check failed:', e);
+            return null;
+        }
+    }
+
+    async function applyRestoredSession(sessionData) {
+        try {
+            const { meta, recs } = sessionData;
             _nextProjectNum = meta.nextProjectNum || 1;
 
             for (const rec of recs) {
                 const proj = createNewProject(rec.name);
                 proj.id = rec.id;
                 proj.settings = rec.settings || { chkSnap: true, chkMergeBlack: true, chkGrid: true };
-                proj.imageDataURL = rec.imageDataURL || null;
+
+                if (rec.imageBlob) {
+                    try {
+                        proj.imageDataURL = await blobToDataURL(rec.imageBlob);
+                    } catch (e) {
+                        console.warn('Image blob restore failed for project', rec.id, e);
+                        proj.imageDataURL = null;
+                    }
+                }
+
+                proj.palettes = rec.palettes || [];
+                proj.tileMappings = rec.tileMappings || [];
+                proj.paletteCounts = rec.paletteCounts || [];
+                proj.errorTiles = rec.errorTiles || [];
+                proj.activeHighlightIndex = rec.activeHighlightIndex != null ? rec.activeHighlightIndex : -1;
+                proj.currentZoom = rec.currentZoom || 1;
+                proj.btnDownloadFixedVisible = rec.btnDownloadFixedVisible || false;
+                proj.imageInfoText = rec.imageInfoText || '';
+                proj.undoStack = (rec.undoStack || []).map(deserializeSnapshot);
+                proj.redoStack = (rec.redoStack || []).map(deserializeSnapshot);
+
                 projects.push(proj);
             }
 
-            _nextProjectNum = meta.nextProjectNum || _nextProjectNum;
-
             const activeId = meta.activeProjectId;
             const activeProj = projects.find(p => p.id === activeId) || projects[0];
-
             activeProjectId = activeProj.id;
 
             document.getElementById('chkSnap').checked = activeProj.settings.chkSnap;
@@ -1773,6 +1969,15 @@
 
             undoStack = activeProj.undoStack;
             redoStack = activeProj.redoStack;
+            globalDetectedPalettes = activeProj.palettes || [];
+            globalTileMappings = activeProj.tileMappings || [];
+            globalPaletteCounts = activeProj.paletteCounts || [];
+            lastErrorTiles = activeProj.errorTiles || [];
+            currentZoom = activeProj.currentZoom || 1;
+            activeHighlightIndex = activeProj.activeHighlightIndex != null ? activeProj.activeHighlightIndex : -1;
+
+            document.getElementById('btnDownloadFixed').style.display =
+                activeProj.btnDownloadFixedVisible ? 'flex' : 'none';
 
             if (activeProj.imageDataURL) {
                 const seq = ++_restoreSeq;
@@ -1783,9 +1988,19 @@
                     drawBaseImage();
                     lastBaseImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
                     resultsArea.style.display = 'block';
-                    if (imageInfo) imageInfo.style.display = 'block';
+                    if (imageInfo) {
+                        imageInfo.style.display = 'block';
+                        imageInfo.textContent = activeProj.imageInfoText || '';
+                    }
                     if (zoomLabel) zoomLabel.style.display = 'block';
-                    runAnalysis();
+                    if (globalDetectedPalettes.length > 0) {
+                        if (document.getElementById('chkGrid').checked && lastErrorTiles.length > 0) {
+                            drawErrorOverlay(lastErrorTiles);
+                        }
+                        renderResults(globalDetectedPalettes, lastErrorTiles, globalPaletteCounts);
+                    } else {
+                        runAnalysis();
+                    }
                     updateHistoryButtons();
                 };
                 img.src = activeProj.imageDataURL;
@@ -1794,10 +2009,41 @@
             renderTabs();
             return true;
         } catch (e) {
-            console.warn('Restore failed:', e);
+            console.warn('Failed to apply restored session:', e);
             return false;
         }
     }
+
+    async function clearSavedSession() {
+        try {
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            tx.objectStore(STORE_NAME).clear();
+            await new Promise((resolve, reject) => {
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+            });
+        } catch (e) {
+            console.warn('Clear session failed:', e);
+        }
+    }
+
+    function showRestoreDialog() {
+        return new Promise((resolve) => {
+            const dialog = document.getElementById('restoreDialog');
+            dialog.style.display = 'flex';
+            window._resolveRestore = resolve;
+        });
+    }
+
+    window.confirmRestore = function(shouldRestore) {
+        const dialog = document.getElementById('restoreDialog');
+        dialog.style.display = 'none';
+        if (window._resolveRestore) {
+            window._resolveRestore(shouldRestore);
+            window._resolveRestore = null;
+        }
+    };
 
     function scheduleAutoSave() {
         if (_autoSaveTimer) clearTimeout(_autoSaveTimer);
@@ -1807,22 +2053,57 @@
     // --- CLOSE PROTECTION ---
     window.addEventListener('beforeunload', (e) => {
         if (projects.some(p => p.dirty)) {
+            persistSession();
             e.preventDefault();
             e.returnValue = '';
         }
     });
 
     // --- INITIALIZATION ---
+    function startFreshSession() {
+        projects.length = 0;
+        const proj = createNewProject();
+        projects.push(proj);
+        activeProjectId = proj.id;
+        undoStack = proj.undoStack;
+        redoStack = proj.redoStack;
+        renderTabs();
+    }
+
     (async function initApp() {
-        const restored = await restoreSession();
-        if (!restored) {
-            const proj = createNewProject();
-            projects.push(proj);
-            activeProjectId = proj.id;
-            undoStack = proj.undoStack;
-            redoStack = proj.redoStack;
-            renderTabs();
+        let sessionData = null;
+        try {
+            sessionData = await checkSavedSession();
+        } catch (e) {
+            console.warn('Session check error, starting fresh:', e);
         }
+
+        if (sessionData) {
+            const refreshMode = sessionData.meta.refreshMode || false;
+            document.getElementById('chkRefreshMode').checked = refreshMode;
+
+            let shouldRestore = false;
+            if (refreshMode) {
+                shouldRestore = true;
+            } else {
+                shouldRestore = await showRestoreDialog();
+            }
+
+            if (shouldRestore) {
+                const success = await applyRestoredSession(sessionData);
+                if (!success) {
+                    console.warn('Restore failed, clearing corrupt data and starting fresh');
+                    await clearSavedSession();
+                    startFreshSession();
+                }
+            } else {
+                await clearSavedSession();
+                startFreshSession();
+            }
+        } else {
+            startFreshSession();
+        }
+
         setInterval(() => {
             if (projects.some(p => p.dirty)) persistSession();
         }, 30000);
