@@ -562,6 +562,117 @@
             border: 1px solid #555;
             background: linear-gradient(to right, #2196F3, #4CAF50, #FFEB3B, #FF9800, #F44336);
         }
+
+        .color-intelligence {
+            background: #333;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border-left: 5px solid #9C27B0;
+        }
+        .color-intelligence h3 { margin: 0 0 12px; font-size: 1rem; }
+        .ci-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+        .ci-slider {
+            flex: 1;
+            min-width: 120px;
+            -webkit-appearance: none;
+            height: 6px;
+            border-radius: 3px;
+            background: #555;
+            outline: none;
+        }
+        .ci-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #9C27B0;
+            cursor: pointer;
+            border: 2px solid #fff;
+        }
+        .ci-slider::-moz-range-thumb {
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #9C27B0;
+            cursor: pointer;
+            border: 2px solid #fff;
+        }
+        .ci-value {
+            font-family: monospace;
+            font-size: 0.9rem;
+            min-width: 50px;
+            text-align: right;
+            color: #ddd;
+        }
+        .merge-preview-box {
+            background: #222;
+            border: 1px solid #555;
+            border-radius: 6px;
+            padding: 12px;
+            margin-top: 10px;
+            display: none;
+        }
+        .merge-preview-box.visible { display: block; }
+        .merge-preview-stats {
+            font-size: 1.1rem;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .merge-preview-stats .reduction { color: var(--success); }
+        .btn-apply-merge {
+            background: #9C27B0;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
+            width: 100%;
+            font-size: 0.95rem;
+        }
+        .btn-apply-merge:hover { filter: brightness(1.15); }
+        .btn-apply-merge:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-preview-merge {
+            background: #7B1FA2;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+        .btn-preview-merge:hover { filter: brightness(1.15); }
+        .swatch-lock {
+            position: absolute;
+            bottom: 2px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.6);
+            border: none;
+            color: #888;
+            font-size: 0.65rem;
+            cursor: pointer;
+            padding: 1px 4px;
+            border-radius: 3px;
+            line-height: 1;
+            opacity: 0;
+            transition: opacity 0.15s;
+        }
+        .swatch:hover .swatch-lock,
+        .swatch-lock.locked { opacity: 1; }
+        .swatch-lock.locked {
+            color: #FFD700;
+            background: rgba(0,0,0,0.8);
+        }
     </style>
 </head>
 <body>
@@ -591,6 +702,10 @@
         <label title="Overlay showing how many times each tile pattern appears">
             <input type="checkbox" id="chkHeatmap" onchange="reAnalyze()">
             <strong>Tile Heatmap</strong>
+        </label>
+        <label title="Snap all colors to a 5-bit-per-channel grid (32 levels) to match Game Boy Color hardware">
+            <input type="checkbox" id="chkRGB555" onchange="reAnalyze()">
+            <strong>Snap Colors to RGB555</strong>
         </label>
         <label title="Skip restore dialog on refresh and auto-restore session">
             <input type="checkbox" id="chkRefreshMode" onchange="scheduleAutoSave()">
@@ -642,6 +757,23 @@
                 <span>Unique</span>
                 <div class="tile-heatmap-gradient"></div>
                 <span>Many duplicates</span>
+            </div>
+        </div>
+
+        <div id="colorIntelligence" class="color-intelligence" style="display:none;">
+            <h3>🧠 Color Intelligence</h3>
+            <div class="ci-row">
+                <label for="ciThreshold" style="margin:0; white-space:nowrap;">ΔE00 Threshold:</label>
+                <input type="range" id="ciThreshold" class="ci-slider" min="1" max="50" value="10" step="0.5" oninput="onThresholdChange()">
+                <span id="ciThresholdValue" class="ci-value">10.0</span>
+            </div>
+            <div class="ci-row">
+                <button class="btn-preview-merge" onclick="previewColorMerge()">🔍 Preview Merge</button>
+                <span id="ciUniqueCount" style="font-size:0.85rem; color:#aaa;"></span>
+            </div>
+            <div id="mergePreviewBox" class="merge-preview-box">
+                <div id="mergePreviewStats" class="merge-preview-stats"></div>
+                <button id="btnApplyMerge" class="btn-apply-merge" onclick="applyColorMerge()" disabled>✨ Apply Merge</button>
             </div>
         </div>
 
@@ -723,6 +855,12 @@
     let lastErrorTiles = [];
     let lastBaseImageData = null; // ImageData from last analysis (before any highlight overlay)
 
+    // --- COLOR INTELLIGENCE STATE ---
+    let lockedColors = new Set();
+    let _lastMergeMap = null;
+    let _lastMergeFromCount = 0;
+    let _lastMergeToCount = 0;
+
     // --- PROJECT MANAGEMENT ---
     let projects = [];
     let activeProjectId = null;
@@ -746,12 +884,13 @@
             baseImageData: null,
             currentZoom: 1,
             activeHighlightIndex: -1,
-            settings: { chkSnap: true, chkMergeBlack: true, chkGrid: true, chkHeatmap: false, tileLimit: 192 },
+            settings: { chkSnap: true, chkMergeBlack: true, chkGrid: true, chkHeatmap: false, chkRGB555: false, tileLimit: 192 },
             undoStack: [],
             redoStack: [],
             btnDownloadFixedVisible: false,
             imageInfoText: '',
             dirty: false,
+            lockedColors: [],
         };
     }
 
@@ -775,10 +914,12 @@
             chkMergeBlack: document.getElementById('chkMergeBlack').checked,
             chkGrid: document.getElementById('chkGrid').checked,
             chkHeatmap: document.getElementById('chkHeatmap').checked,
+            chkRGB555: document.getElementById('chkRGB555').checked,
             tileLimit: currentTileLimit,
         };
         proj.undoStack = undoStack;
         proj.redoStack = redoStack;
+        proj.lockedColors = Array.from(lockedColors);
         proj.btnDownloadFixedVisible = document.getElementById('btnDownloadFixed').style.display !== 'none';
         proj.imageInfoText = imageInfo ? imageInfo.textContent : '';
     }
@@ -799,8 +940,10 @@
         document.getElementById('chkMergeBlack').checked = proj.settings.chkMergeBlack;
         document.getElementById('chkGrid').checked = proj.settings.chkGrid;
         document.getElementById('chkHeatmap').checked = proj.settings.chkHeatmap || false;
+        document.getElementById('chkRGB555').checked = proj.settings.chkRGB555 || false;
         currentTileLimit = proj.settings.tileLimit || TILE_LIMIT_MODES.MONO;
         document.getElementById('tileLimitMode').value = String(currentTileLimit);
+        lockedColors = new Set(proj.lockedColors || []);
 
         globalDetectedPalettes = proj.palettes || [];
         globalTileMappings = proj.tileMappings || [];
@@ -919,12 +1062,14 @@
                 chkMergeBlack: document.getElementById('chkMergeBlack').checked,
                 chkGrid: document.getElementById('chkGrid').checked,
                 chkHeatmap: document.getElementById('chkHeatmap').checked,
+                chkRGB555: document.getElementById('chkRGB555').checked,
                 tileLimit: currentTileLimit,
             },
             activeHighlightIndex: activeHighlightIndex,
             currentZoom: currentZoom,
             btnDownloadFixedVisible: document.getElementById('btnDownloadFixed').style.display !== 'none',
             imageInfoText: imageInfo ? imageInfo.textContent : '',
+            lockedColors: Array.from(lockedColors),
         };
     }
 
@@ -934,8 +1079,10 @@
         document.getElementById('chkMergeBlack').checked = snapshot.settings.chkMergeBlack;
         document.getElementById('chkGrid').checked = snapshot.settings.chkGrid;
         document.getElementById('chkHeatmap').checked = snapshot.settings.chkHeatmap || false;
+        document.getElementById('chkRGB555').checked = snapshot.settings.chkRGB555 || false;
         currentTileLimit = snapshot.settings.tileLimit || TILE_LIMIT_MODES.MONO;
         document.getElementById('tileLimitMode').value = String(currentTileLimit);
+        lockedColors = new Set(snapshot.lockedColors || []);
 
         globalDetectedPalettes = snapshot.palettes;
         globalTileMappings = snapshot.tileMappings;
@@ -1185,6 +1332,122 @@
         return (r1-r2)**2 + (g1-g2)**2 + (b1-b2)**2;
     }
 
+    // --- RGB555 NORMALIZATION ---
+    function snapToRGB555(r, g, b) {
+        const r5 = Math.round(r * 31 / 255);
+        const g5 = Math.round(g * 31 / 255);
+        const b5 = Math.round(b * 31 / 255);
+        return [
+            Math.round(r5 * 255 / 31),
+            Math.round(g5 * 255 / 31),
+            Math.round(b5 * 255 / 31)
+        ];
+    }
+
+    // --- PERCEPTUAL COLOR SCIENCE (CIEDE2000) ---
+    function rgbToLab(r, g, b) {
+        let rl = r / 255, gl = g / 255, bl = b / 255;
+        rl = rl > 0.04045 ? Math.pow((rl + 0.055) / 1.055, 2.4) : rl / 12.92;
+        gl = gl > 0.04045 ? Math.pow((gl + 0.055) / 1.055, 2.4) : gl / 12.92;
+        bl = bl > 0.04045 ? Math.pow((bl + 0.055) / 1.055, 2.4) : bl / 12.92;
+
+        let x = (rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375) / 0.95047;
+        let y = (rl * 0.2126729 + gl * 0.7151522 + bl * 0.0721750);
+        let z = (rl * 0.0193339 + gl * 0.1191920 + bl * 0.9503041) / 1.08883;
+
+        const eps = 0.008856;
+        const kap = 903.3;
+        x = x > eps ? Math.cbrt(x) : (kap * x + 16) / 116;
+        y = y > eps ? Math.cbrt(y) : (kap * y + 16) / 116;
+        z = z > eps ? Math.cbrt(z) : (kap * z + 16) / 116;
+
+        return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
+    }
+
+    function ciede2000(L1, a1, b1, L2, a2, b2) {
+        const RAD = Math.PI / 180;
+        const DEG = 180 / Math.PI;
+        const POW25_7 = 6103515625; // 25^7
+
+        const Cab1 = Math.sqrt(a1 * a1 + b1 * b1);
+        const Cab2 = Math.sqrt(a2 * a2 + b2 * b2);
+        const CabAvg = (Cab1 + Cab2) / 2;
+        const CabAvg7 = Math.pow(CabAvg, 7);
+        const G = 0.5 * (1 - Math.sqrt(CabAvg7 / (CabAvg7 + POW25_7)));
+
+        const ap1 = a1 * (1 + G);
+        const ap2 = a2 * (1 + G);
+
+        const Cp1 = Math.sqrt(ap1 * ap1 + b1 * b1);
+        const Cp2 = Math.sqrt(ap2 * ap2 + b2 * b2);
+
+        let hp1 = Math.atan2(b1, ap1) * DEG;
+        if (hp1 < 0) hp1 += 360;
+        let hp2 = Math.atan2(b2, ap2) * DEG;
+        if (hp2 < 0) hp2 += 360;
+
+        const dLp = L2 - L1;
+        const dCp = Cp2 - Cp1;
+
+        let dhp;
+        if (Cp1 * Cp2 === 0) {
+            dhp = 0;
+        } else if (Math.abs(hp2 - hp1) <= 180) {
+            dhp = hp2 - hp1;
+        } else if (hp2 - hp1 > 180) {
+            dhp = hp2 - hp1 - 360;
+        } else {
+            dhp = hp2 - hp1 + 360;
+        }
+
+        const dHp = 2 * Math.sqrt(Cp1 * Cp2) * Math.sin(dhp / 2 * RAD);
+
+        const Lp = (L1 + L2) / 2;
+        const Cp = (Cp1 + Cp2) / 2;
+
+        let hp;
+        if (Cp1 * Cp2 === 0) {
+            hp = hp1 + hp2;
+        } else if (Math.abs(hp1 - hp2) <= 180) {
+            hp = (hp1 + hp2) / 2;
+        } else if (hp1 + hp2 < 360) {
+            hp = (hp1 + hp2 + 360) / 2;
+        } else {
+            hp = (hp1 + hp2 - 360) / 2;
+        }
+
+        const T = 1
+            - 0.17 * Math.cos((hp - 30) * RAD)
+            + 0.24 * Math.cos(2 * hp * RAD)
+            + 0.32 * Math.cos((3 * hp + 6) * RAD)
+            - 0.20 * Math.cos((4 * hp - 63) * RAD);
+
+        const Lp50sq = (Lp - 50) * (Lp - 50);
+        const SL = 1 + 0.015 * Lp50sq / Math.sqrt(20 + Lp50sq);
+        const SC = 1 + 0.045 * Cp;
+        const SH = 1 + 0.015 * Cp * T;
+
+        const Cp7 = Math.pow(Cp, 7);
+        const RC = 2 * Math.sqrt(Cp7 / (Cp7 + POW25_7));
+        const dTheta = 30 * Math.exp(-(((hp - 275) / 25) ** 2));
+        const RT = -Math.sin(2 * dTheta * RAD) * RC;
+
+        return Math.sqrt(
+            (dLp / SL) ** 2 +
+            (dCp / SC) ** 2 +
+            (dHp / SH) ** 2 +
+            RT * (dCp / SC) * (dHp / SH)
+        );
+    }
+
+    function deltaE00Hex(hex1, hex2) {
+        const [r1, g1, b1v] = hexToRgb(hex1);
+        const [r2, g2, b2v] = hexToRgb(hex2);
+        const [L1, a1, b1] = rgbToLab(r1, g1, b1v);
+        const [L2, a2, b2] = rgbToLab(r2, g2, b2v);
+        return ciede2000(L1, a1, b1, L2, a2, b2);
+    }
+
     // --- GB STUDIO ORDER FIX (LIGHT -> DARK) ---
     // Higher luminance = lighter. GB Studio expects palette slots ordered lightest -> darkest.
     function luminanceFromHex(hex) {
@@ -1270,7 +1533,7 @@
     }
 
     // --- TILE HASHING ---
-    function hashTile(data, width, height, tileX, tileY, shouldSnap, shouldMergeBlack) {
+    function hashTile(data, width, height, tileX, tileY, shouldSnap, shouldMergeBlack, shouldRGB555) {
         let hash = '';
         for (let dy = 0; dy < 8; dy++) {
             for (let dx = 0; dx < 8; dx++) {
@@ -1288,7 +1551,8 @@
                 }
                 let r = data[i], g = data[i + 1], b = data[i + 2];
                 if (shouldMergeBlack && r < 24 && g < 24 && b < 24) { r = 0; g = 0; b = 0; }
-                if (shouldSnap) { [r, g, b] = snapColor(r, g, b); }
+                if (shouldRGB555) { [r, g, b] = snapToRGB555(r, g, b); }
+                else if (shouldSnap) { [r, g, b] = snapColor(r, g, b); }
                 hash += String.fromCharCode(r) + String.fromCharCode(g) + String.fromCharCode(b);
             }
         }
@@ -1399,6 +1663,7 @@
         lastBaseImageData = imgData;
         const data = imgData.data;
         const shouldSnap = document.getElementById('chkSnap').checked;
+        const shouldRGB555 = document.getElementById('chkRGB555').checked;
         const shouldMergeBlack = document.getElementById('chkMergeBlack').checked;
         const showGrid = document.getElementById('chkGrid').checked;
 
@@ -1413,7 +1678,7 @@
             for (let x = 0; x < width; x += 8) {
                 totalTiles++;
 
-                const tileHash = hashTile(data, width, height, x, y, shouldSnap, shouldMergeBlack);
+                const tileHash = hashTile(data, width, height, x, y, shouldSnap, shouldMergeBlack, shouldRGB555);
                 if (!tileHashMap.has(tileHash)) {
                     tileHashMap.set(tileHash, { count: 0, positions: [] });
                 }
@@ -1440,7 +1705,9 @@
                             if (r < 24 && g < 24 && b < 24) { r = 0; g = 0; b = 0; }
                         }
 
-                        if (shouldSnap) {
+                        if (shouldRGB555) {
+                            [r, g, b] = snapToRGB555(r, g, b);
+                        } else if (shouldSnap) {
                             [r, g, b] = snapColor(r, g, b);
                         }
 
@@ -1532,6 +1799,33 @@
         }
 
         updateTileLimitDisplay();
+
+        const ciSection = document.getElementById('colorIntelligence');
+        if (ciSection) {
+            ciSection.style.display = 'block';
+            const allUniqueColors = new Set();
+            masterPalettes.forEach(pal => pal.forEach(c => allUniqueColors.add(c)));
+            errorTiles.forEach(t => {
+                for (let dy = 0; dy < 8; dy++) {
+                    for (let dx = 0; dx < 8; dx++) {
+                        const px = t.x + dx, py = t.y + dy;
+                        if (px >= width || py >= height) continue;
+                        const i = (py * width + px) * 4;
+                        if (data[i + 3] < 128) continue;
+                        let r = data[i], g = data[i + 1], b = data[i + 2];
+                        if (shouldMergeBlack && r < 24 && g < 24 && b < 24) { r = 0; g = 0; b = 0; }
+                        if (shouldRGB555) { [r, g, b] = snapToRGB555(r, g, b); }
+                        else if (shouldSnap) { [r, g, b] = snapColor(r, g, b); }
+                        allUniqueColors.add(rgbToHex(r, g, b));
+                    }
+                }
+            });
+            const ciCount = document.getElementById('ciUniqueCount');
+            if (ciCount) ciCount.textContent = allUniqueColors.size + ' unique colors detected';
+        }
+        const mergeBox = document.getElementById('mergePreviewBox');
+        if (mergeBox) mergeBox.classList.remove('visible');
+
         renderResults(masterPalettes, errorTiles, counts);
     }
 
@@ -1550,6 +1844,7 @@
         const tileY = Math.floor(py / 8) * 8;
 
         const shouldSnap = document.getElementById('chkSnap').checked;
+        const shouldRGB555 = document.getElementById('chkRGB555').checked;
         const shouldMergeBlack = document.getElementById('chkMergeBlack').checked;
         const data = lastBaseImageData.data;
 
@@ -1566,7 +1861,9 @@
                 if (shouldMergeBlack) {
                     if (r < 24 && g < 24 && b < 24) { r = 0; g = 0; b = 0; }
                 }
-                if (shouldSnap) {
+                if (shouldRGB555) {
+                    [r, g, b] = snapToRGB555(r, g, b);
+                } else if (shouldSnap) {
                     [r, g, b] = snapColor(r, g, b);
                 }
                 const hex = rgbToHex(r, g, b);
@@ -1649,7 +1946,8 @@
             let hexHTML = '';
 
             pal.forEach(c => {
-                swatchHTML += `<div class="swatch" style="background-color: ${c}"></div>`;
+                const isLocked = lockedColors.has(c);
+                swatchHTML += `<div class="swatch" style="background-color: ${c}"><button class="swatch-lock ${isLocked ? 'locked' : ''}" onclick="event.stopPropagation(); toggleColorLock('${c}', this)" title="${isLocked ? 'Unlock color' : 'Lock color (protected from merges)'}">${isLocked ? '\uD83D\uDD12' : '\uD83D\uDD13'}</button></div>`;
                 hexHTML += `<span>${c}</span>`;
             });
 
@@ -1859,6 +2157,179 @@
             runAnalysis();
         };
         newImg.src = newUrl;
+    }
+
+    // --- COLOR INTELLIGENCE: MERGE FUNCTIONS ---
+
+    function getSnapFn() {
+        const shouldRGB555 = document.getElementById('chkRGB555').checked;
+        const shouldSnap = document.getElementById('chkSnap').checked;
+        const shouldMergeBlack = document.getElementById('chkMergeBlack').checked;
+        return function(r, g, b) {
+            if (shouldMergeBlack && r < 24 && g < 24 && b < 24) { r = 0; g = 0; b = 0; }
+            if (shouldRGB555) { [r, g, b] = snapToRGB555(r, g, b); }
+            else if (shouldSnap) { [r, g, b] = snapColor(r, g, b); }
+            return [r, g, b];
+        };
+    }
+
+    function collectImageColors() {
+        if (!originalImage || !lastBaseImageData) return new Map();
+        const data = lastBaseImageData.data;
+        const snap = getSnapFn();
+        const colorCounts = new Map();
+        for (let i = 0; i < data.length; i += 4) {
+            if (data[i + 3] < 128) continue;
+            const [r, g, b] = snap(data[i], data[i + 1], data[i + 2]);
+            const hex = rgbToHex(r, g, b);
+            colorCounts.set(hex, (colorCounts.get(hex) || 0) + 1);
+        }
+        return colorCounts;
+    }
+
+    function computeMergeMap(colorCounts, threshold) {
+        const colors = Array.from(colorCounts.keys());
+        const counts = new Map(colorCounts);
+
+        const labCache = new Map();
+        colors.forEach(hex => {
+            const [r, g, b] = hexToRgb(hex);
+            labCache.set(hex, rgbToLab(r, g, b));
+        });
+
+        const sorted = colors.slice().sort((a, b) => {
+            const la = lockedColors.has(a) ? 1 : 0;
+            const lb = lockedColors.has(b) ? 1 : 0;
+            if (la !== lb) return lb - la;
+            return counts.get(b) - counts.get(a);
+        });
+
+        const mergeMap = new Map();
+        const merged = new Set();
+
+        for (let i = 0; i < sorted.length; i++) {
+            const target = sorted[i];
+            if (merged.has(target)) continue;
+
+            const [L1, a1, b1Lab] = labCache.get(target);
+
+            for (let j = i + 1; j < sorted.length; j++) {
+                const source = sorted[j];
+                if (merged.has(source)) continue;
+                if (lockedColors.has(source)) continue;
+
+                const [L2, a2, b2Lab] = labCache.get(source);
+                const dE = ciede2000(L1, a1, b1Lab, L2, a2, b2Lab);
+
+                if (dE <= threshold) {
+                    mergeMap.set(source, target);
+                    merged.add(source);
+                }
+            }
+        }
+
+        return mergeMap;
+    }
+
+    function onThresholdChange() {
+        const slider = document.getElementById('ciThreshold');
+        const display = document.getElementById('ciThresholdValue');
+        display.textContent = parseFloat(slider.value).toFixed(1);
+        const box = document.getElementById('mergePreviewBox');
+        if (box) box.classList.remove('visible');
+    }
+
+    function previewColorMerge() {
+        const colorCounts = collectImageColors();
+        if (colorCounts.size === 0) return;
+
+        const threshold = parseFloat(document.getElementById('ciThreshold').value);
+        const mergeMap = computeMergeMap(colorCounts, threshold);
+
+        const fromCount = colorCounts.size;
+        const toCount = fromCount - mergeMap.size;
+
+        _lastMergeMap = mergeMap;
+        _lastMergeFromCount = fromCount;
+        _lastMergeToCount = toCount;
+
+        const box = document.getElementById('mergePreviewBox');
+        const stats = document.getElementById('mergePreviewStats');
+        const btn = document.getElementById('btnApplyMerge');
+
+        if (mergeMap.size === 0) {
+            stats.innerHTML = `No colors to merge at \u0394E00 \u2264 ${threshold.toFixed(1)}`;
+            btn.disabled = true;
+        } else {
+            stats.innerHTML = `Merge <strong>${fromCount}</strong> colors \u2192 <strong class="reduction">${toCount}</strong> colors <span style="color:#aaa; font-size:0.85rem;">(\u2212${mergeMap.size} at \u0394E00 \u2264 ${threshold.toFixed(1)})</span>`;
+            btn.disabled = false;
+        }
+        box.classList.add('visible');
+    }
+
+    function applyColorMerge() {
+        if (!_lastMergeMap || _lastMergeMap.size === 0 || !originalImage) return;
+
+        applyAction('Color Merge (\u0394E00)', () => {
+            const mergeMap = _lastMergeMap;
+            const width = originalImage.width;
+            const height = originalImage.height;
+
+            drawBaseImage();
+            const imgData = ctx.getImageData(0, 0, width, height);
+            const data = imgData.data;
+            const snap = getSnapFn();
+
+            const targetRGB = new Map();
+            mergeMap.forEach((target, source) => {
+                if (!targetRGB.has(source)) {
+                    targetRGB.set(source, hexToRgb(target));
+                }
+            });
+
+            for (let i = 0; i < data.length; i += 4) {
+                if (data[i + 3] < 128) continue;
+                const [r, g, b] = snap(data[i], data[i + 1], data[i + 2]);
+                const hex = rgbToHex(r, g, b);
+
+                if (targetRGB.has(hex)) {
+                    const [nr, ng, nb] = targetRGB.get(hex);
+                    data[i] = nr;
+                    data[i + 1] = ng;
+                    data[i + 2] = nb;
+                } else {
+                    data[i] = r;
+                    data[i + 1] = g;
+                    data[i + 2] = b;
+                }
+            }
+
+            ctx.putImageData(imgData, 0, 0);
+            const newUrl = canvas.toDataURL();
+            const newImg = new Image();
+            newImg.onload = () => {
+                originalImage = newImg;
+                document.getElementById('btnDownloadFixed').style.display = 'flex';
+                _lastMergeMap = null;
+                const box = document.getElementById('mergePreviewBox');
+                if (box) box.classList.remove('visible');
+                runAnalysis();
+            };
+            newImg.src = newUrl;
+        });
+    }
+
+    function toggleColorLock(hex, btn) {
+        if (lockedColors.has(hex)) {
+            lockedColors.delete(hex);
+            btn.classList.remove('locked');
+            btn.textContent = '\uD83D\uDD13';
+        } else {
+            lockedColors.add(hex);
+            btn.classList.add('locked');
+            btn.textContent = '\uD83D\uDD12';
+        }
+        scheduleAutoSave();
     }
 
     function downloadFixedImage() {
@@ -2079,6 +2550,7 @@
             currentZoom: snap.currentZoom,
             btnDownloadFixedVisible: snap.btnDownloadFixedVisible,
             imageInfoText: snap.imageInfoText || '',
+            lockedColors: snap.lockedColors || [],
         };
     }
 
@@ -2095,6 +2567,7 @@
             currentZoom: data.currentZoom || 1,
             btnDownloadFixedVisible: data.btnDownloadFixedVisible || false,
             imageInfoText: data.imageInfoText || '',
+            lockedColors: data.lockedColors || [],
         };
     }
 
@@ -2152,6 +2625,7 @@
                     imageInfoText: proj.imageInfoText || '',
                     undoStack: trimmedUndo,
                     redoStack: trimmedRedo,
+                    lockedColors: proj.lockedColors || [],
                 });
             }
 
@@ -2226,6 +2700,7 @@
                 proj.imageInfoText = rec.imageInfoText || '';
                 proj.undoStack = (rec.undoStack || []).map(deserializeSnapshot);
                 proj.redoStack = (rec.redoStack || []).map(deserializeSnapshot);
+                proj.lockedColors = rec.lockedColors || [];
 
                 projects.push(proj);
             }
@@ -2238,8 +2713,10 @@
             document.getElementById('chkMergeBlack').checked = activeProj.settings.chkMergeBlack;
             document.getElementById('chkGrid').checked = activeProj.settings.chkGrid;
             document.getElementById('chkHeatmap').checked = activeProj.settings.chkHeatmap || false;
+            document.getElementById('chkRGB555').checked = activeProj.settings.chkRGB555 || false;
             currentTileLimit = activeProj.settings.tileLimit || TILE_LIMIT_MODES.MONO;
             document.getElementById('tileLimitMode').value = String(currentTileLimit);
+            lockedColors = new Set(activeProj.lockedColors || []);
 
             undoStack = activeProj.undoStack;
             redoStack = activeProj.redoStack;
