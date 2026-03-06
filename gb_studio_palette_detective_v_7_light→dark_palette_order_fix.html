@@ -471,6 +471,97 @@
             z-index: 100;
         }
         .persist-badge.show { opacity: 1; }
+
+        .tile-limit-section {
+            background: #333;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border-left: 5px solid var(--primary);
+        }
+        .tile-limit-section.over-limit { border-left-color: var(--danger); }
+        .tile-limit-section.within-limit { border-left-color: var(--success); }
+
+        .tile-limit-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .tile-limit-header h3 { margin: 0; font-size: 1rem; }
+
+        .tile-limit-mode {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+        }
+        .tile-limit-mode select {
+            background: #222;
+            color: white;
+            border: 1px solid #555;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            cursor: pointer;
+        }
+        .tile-limit-mode select:focus { outline: none; border-color: var(--primary); }
+
+        .tile-meter {
+            width: 100%;
+            height: 22px;
+            background: #222;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+            border: 1px solid #555;
+        }
+        .tile-meter-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.3s ease, background 0.3s ease;
+        }
+        .tile-meter-label {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.8rem;
+            font-weight: bold;
+            color: white;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+            pointer-events: none;
+        }
+
+        .tile-limit-warning {
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: rgba(255, 68, 68, 0.15);
+            border: 1px solid var(--danger);
+            border-radius: 4px;
+            color: var(--danger);
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+
+        .tile-heatmap-legend {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 10px;
+            font-size: 0.8rem;
+            color: #aaa;
+        }
+        .tile-heatmap-gradient {
+            width: 120px;
+            height: 14px;
+            border-radius: 3px;
+            border: 1px solid #555;
+            background: linear-gradient(to right, #2196F3, #4CAF50, #FFEB3B, #FF9800, #F44336);
+        }
     </style>
 </head>
 <body>
@@ -496,6 +587,10 @@
         <label>
             <input type="checkbox" id="chkGrid" checked onchange="reAnalyze()">
             Show Error Grid
+        </label>
+        <label title="Overlay showing how many times each tile pattern appears">
+            <input type="checkbox" id="chkHeatmap" onchange="reAnalyze()">
+            <strong>Tile Heatmap</strong>
         </label>
         <label title="Skip restore dialog on refresh and auto-restore session">
             <input type="checkbox" id="chkRefreshMode" onchange="scheduleAutoSave()">
@@ -525,6 +620,29 @@
             <button id="btnFixBadTiles" class="btn-fix-tiles" onclick="fixBadTiles()">
                 🔧 Fix Bad Tiles (Reduce to 4 Colors Each)
             </button>
+        </div>
+
+        <div id="tileLimitSection" class="tile-limit-section" style="display:none;">
+            <div class="tile-limit-header">
+                <h3 id="tileLimitTitle">Unique Tiles: 0 / 192</h3>
+                <div class="tile-limit-mode">
+                    <label for="tileLimitMode" style="margin:0; font-size:0.85rem; color:#aaa;">Limit:</label>
+                    <select id="tileLimitMode" onchange="onTileLimitModeChange()">
+                        <option value="192">192 — Mono / Mixed</option>
+                        <option value="384">384 — Color Only</option>
+                    </select>
+                </div>
+            </div>
+            <div class="tile-meter">
+                <div id="tileMeterFill" class="tile-meter-fill" style="width:0%;background:var(--success);"></div>
+                <div id="tileMeterLabel" class="tile-meter-label">0%</div>
+            </div>
+            <div id="tileLimitWarning" class="tile-limit-warning" style="display:none;"></div>
+            <div id="tileHeatmapLegend" class="tile-heatmap-legend" style="display:none;">
+                <span>Unique</span>
+                <div class="tile-heatmap-gradient"></div>
+                <span>Many duplicates</span>
+            </div>
         </div>
 
         <div class="legend">
@@ -589,6 +707,13 @@
     const MAX_USER_PALETTES = 7;
     const FIXED_8TH_PALETTE = ["#FFFFFF", "#AAAAAA", "#555555", "#000000"]; // light to dark (grayscale)
 
+    // --- TILE LIMIT CONSTANTS ---
+    const TILE_LIMIT_MODES = { MONO: 192, COLOR: 384 };
+    let currentTileLimit = TILE_LIMIT_MODES.MONO;
+    let globalUniqueTileCount = 0;
+    let globalTileHashMap = new Map();  // hash -> { count, positions: [{x,y}] }
+    let _tileHashCache = new Map();     // cacheKey -> hash (invalidated on settings change)
+
     let originalImage = null;
     let globalDetectedPalettes = [];
     let globalTileMappings = []; // Stores {x, y, index}
@@ -621,7 +746,7 @@
             baseImageData: null,
             currentZoom: 1,
             activeHighlightIndex: -1,
-            settings: { chkSnap: true, chkMergeBlack: true, chkGrid: true },
+            settings: { chkSnap: true, chkMergeBlack: true, chkGrid: true, chkHeatmap: false, tileLimit: 192 },
             undoStack: [],
             redoStack: [],
             btnDownloadFixedVisible: false,
@@ -649,6 +774,8 @@
             chkSnap: document.getElementById('chkSnap').checked,
             chkMergeBlack: document.getElementById('chkMergeBlack').checked,
             chkGrid: document.getElementById('chkGrid').checked,
+            chkHeatmap: document.getElementById('chkHeatmap').checked,
+            tileLimit: currentTileLimit,
         };
         proj.undoStack = undoStack;
         proj.redoStack = redoStack;
@@ -671,6 +798,9 @@
         document.getElementById('chkSnap').checked = proj.settings.chkSnap;
         document.getElementById('chkMergeBlack').checked = proj.settings.chkMergeBlack;
         document.getElementById('chkGrid').checked = proj.settings.chkGrid;
+        document.getElementById('chkHeatmap').checked = proj.settings.chkHeatmap || false;
+        currentTileLimit = proj.settings.tileLimit || TILE_LIMIT_MODES.MONO;
+        document.getElementById('tileLimitMode').value = String(currentTileLimit);
 
         globalDetectedPalettes = proj.palettes || [];
         globalTileMappings = proj.tileMappings || [];
@@ -724,6 +854,7 @@
             resultsArea.style.display = 'none';
             if (imageInfo) imageInfo.style.display = 'none';
             if (zoomLabel) zoomLabel.style.display = 'none';
+            document.getElementById('tileLimitSection').style.display = 'none';
             updateHistoryButtons();
         }
 
@@ -787,6 +918,8 @@
                 chkSnap: document.getElementById('chkSnap').checked,
                 chkMergeBlack: document.getElementById('chkMergeBlack').checked,
                 chkGrid: document.getElementById('chkGrid').checked,
+                chkHeatmap: document.getElementById('chkHeatmap').checked,
+                tileLimit: currentTileLimit,
             },
             activeHighlightIndex: activeHighlightIndex,
             currentZoom: currentZoom,
@@ -800,6 +933,9 @@
         document.getElementById('chkSnap').checked = snapshot.settings.chkSnap;
         document.getElementById('chkMergeBlack').checked = snapshot.settings.chkMergeBlack;
         document.getElementById('chkGrid').checked = snapshot.settings.chkGrid;
+        document.getElementById('chkHeatmap').checked = snapshot.settings.chkHeatmap || false;
+        currentTileLimit = snapshot.settings.tileLimit || TILE_LIMIT_MODES.MONO;
+        document.getElementById('tileLimitMode').value = String(currentTileLimit);
 
         globalDetectedPalettes = snapshot.palettes;
         globalTileMappings = snapshot.tileMappings;
@@ -1084,7 +1220,6 @@
     }
 
     function drawErrorOverlay(errorTiles) {
-        clearErrorOverlay();
         if (errorTiles.length === 0) return;
         overlayCtx.lineWidth = 1;
         overlayCtx.strokeStyle = "rgba(255, 0, 0, 0.8)";
@@ -1134,6 +1269,124 @@
         });
     }
 
+    // --- TILE HASHING ---
+    function hashTile(data, width, height, tileX, tileY, shouldSnap, shouldMergeBlack) {
+        let hash = '';
+        for (let dy = 0; dy < 8; dy++) {
+            for (let dx = 0; dx < 8; dx++) {
+                const px = tileX + dx;
+                const py = tileY + dy;
+                if (px >= width || py >= height) {
+                    hash += '____';
+                    continue;
+                }
+                const i = (py * width + px) * 4;
+                const a = data[i + 3];
+                if (a < 128) {
+                    hash += '____';
+                    continue;
+                }
+                let r = data[i], g = data[i + 1], b = data[i + 2];
+                if (shouldMergeBlack && r < 24 && g < 24 && b < 24) { r = 0; g = 0; b = 0; }
+                if (shouldSnap) { [r, g, b] = snapColor(r, g, b); }
+                hash += String.fromCharCode(r) + String.fromCharCode(g) + String.fromCharCode(b);
+            }
+        }
+        return hash;
+    }
+
+    function onTileLimitModeChange() {
+        const sel = document.getElementById('tileLimitMode');
+        currentTileLimit = parseInt(sel.value, 10);
+        updateTileLimitDisplay();
+        scheduleAutoSave();
+    }
+
+    function updateTileLimitDisplay() {
+        const section = document.getElementById('tileLimitSection');
+        const title = document.getElementById('tileLimitTitle');
+        const meterFill = document.getElementById('tileMeterFill');
+        const meterLabel = document.getElementById('tileMeterLabel');
+        const warning = document.getElementById('tileLimitWarning');
+        const heatmapLegend = document.getElementById('tileHeatmapLegend');
+
+        if (!section) return;
+        section.style.display = 'block';
+
+        const count = globalUniqueTileCount;
+        const limit = currentTileLimit;
+        const pct = Math.min(100, (count / limit) * 100);
+        const overBy = count - limit;
+
+        title.textContent = `Unique Tiles: ${count} / ${limit}`;
+
+        meterFill.style.width = pct + '%';
+        meterLabel.textContent = Math.round(pct) + '%';
+
+        if (overBy > 0) {
+            section.className = 'tile-limit-section over-limit';
+            meterFill.style.background = 'var(--danger)';
+            warning.style.display = 'block';
+            warning.textContent = `Tile limit exceeded by ${overBy} tile${overBy === 1 ? '' : 's'}`;
+        } else if (pct > 85) {
+            section.className = 'tile-limit-section';
+            section.style.borderLeftColor = 'var(--warning)';
+            meterFill.style.background = 'var(--warning)';
+            warning.style.display = 'none';
+        } else {
+            section.className = 'tile-limit-section within-limit';
+            meterFill.style.background = 'var(--success)';
+            warning.style.display = 'none';
+        }
+
+        const showHeatmap = document.getElementById('chkHeatmap').checked;
+        heatmapLegend.style.display = showHeatmap ? 'flex' : 'none';
+    }
+
+    function drawTileHeatmapOverlay() {
+        clearErrorOverlay();
+        if (globalTileHashMap.size === 0) return;
+
+        let maxCount = 1;
+        globalTileHashMap.forEach(entry => {
+            if (entry.count > maxCount) maxCount = entry.count;
+        });
+
+        if (maxCount <= 1) return;
+
+        const colors = [
+            [33, 150, 243],   // blue (unique)
+            [76, 175, 80],    // green
+            [255, 235, 59],   // yellow
+            [255, 152, 0],    // orange
+            [244, 67, 54],    // red (many dupes)
+        ];
+
+        function interpolateColor(t) {
+            t = Math.max(0, Math.min(1, t));
+            const pos = t * (colors.length - 1);
+            const lo = Math.floor(pos);
+            const hi = Math.min(lo + 1, colors.length - 1);
+            const frac = pos - lo;
+            return [
+                Math.round(colors[lo][0] + (colors[hi][0] - colors[lo][0]) * frac),
+                Math.round(colors[lo][1] + (colors[hi][1] - colors[lo][1]) * frac),
+                Math.round(colors[lo][2] + (colors[hi][2] - colors[lo][2]) * frac),
+            ];
+        }
+
+        overlayCtx.globalAlpha = 1;
+        globalTileHashMap.forEach(entry => {
+            const t = (entry.count - 1) / (maxCount - 1);
+            const [r, g, b] = interpolateColor(t);
+            const alpha = 0.15 + t * 0.45;
+            overlayCtx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+            entry.positions.forEach(pos => {
+                overlayCtx.fillRect(pos.x, pos.y, 8, 8);
+            });
+        });
+    }
+
     function runAnalysis() {
         if(!originalImage) return;
 
@@ -1154,9 +1407,19 @@
         let tileMappings = [];
         let totalTiles = 0;
 
+        const tileHashMap = new Map();
+
         for (let y = 0; y < height; y += 8) {
             for (let x = 0; x < width; x += 8) {
                 totalTiles++;
+
+                const tileHash = hashTile(data, width, height, x, y, shouldSnap, shouldMergeBlack);
+                if (!tileHashMap.has(tileHash)) {
+                    tileHashMap.set(tileHash, { count: 0, positions: [] });
+                }
+                const entry = tileHashMap.get(tileHash);
+                entry.count++;
+                entry.positions.push({ x, y });
 
                 let tileColors = new Set();
 
@@ -1232,11 +1495,7 @@
         }
 
         lastErrorTiles = errorTiles;
-        if (showGrid && errorTiles.length > 0) {
-            drawErrorOverlay(errorTiles);
-        } else {
-            clearErrorOverlay();
-        }
+        clearErrorOverlay();
 
         // GB Studio requires exactly 4 colors per palette — fill empty slots with black.
         masterPalettes.forEach(pal => {
@@ -1261,6 +1520,18 @@
         // Sort palette colors for GB Studio: LIGHT -> DARK (instead of dark -> light / arbitrary)
         masterPalettes.forEach(pal => sortPaletteLightToDark(pal));
 
+        globalTileHashMap = tileHashMap;
+        globalUniqueTileCount = tileHashMap.size;
+
+        const showHeatmap = document.getElementById('chkHeatmap').checked;
+        if (showHeatmap) {
+            drawTileHeatmapOverlay();
+        }
+        if (showGrid && errorTiles.length > 0) {
+            drawErrorOverlay(errorTiles);
+        }
+
+        updateTileLimitDisplay();
         renderResults(masterPalettes, errorTiles, counts);
     }
 
@@ -1966,6 +2237,9 @@
             document.getElementById('chkSnap').checked = activeProj.settings.chkSnap;
             document.getElementById('chkMergeBlack').checked = activeProj.settings.chkMergeBlack;
             document.getElementById('chkGrid').checked = activeProj.settings.chkGrid;
+            document.getElementById('chkHeatmap').checked = activeProj.settings.chkHeatmap || false;
+            currentTileLimit = activeProj.settings.tileLimit || TILE_LIMIT_MODES.MONO;
+            document.getElementById('tileLimitMode').value = String(currentTileLimit);
 
             undoStack = activeProj.undoStack;
             redoStack = activeProj.redoStack;
