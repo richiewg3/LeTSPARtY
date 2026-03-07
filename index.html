@@ -733,6 +733,36 @@
             color: #FFD700;
             background: rgba(0,0,0,0.8);
         }
+
+        .paste-hint {
+            font-size: 0.8rem;
+            color: #666;
+            margin-top: 10px;
+            pointer-events: none;
+        }
+
+        .target-palette-status {
+            font-size: 0.8rem;
+            min-height: 1.2em;
+            transition: color 0.2s;
+        }
+
+        .before-after-badge {
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            background: rgba(0,0,0,0.7);
+            color: #fff;
+            padding: 3px 10px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            pointer-events: none;
+            z-index: 10;
+            opacity: 0;
+            transition: opacity 0.1s;
+        }
+        .before-after-badge.visible { opacity: 1; }
     </style>
 </head>
 <body>
@@ -786,6 +816,7 @@
             <button class="btn-url-load" id="btnUrlLoad" onclick="loadImageFromURL()">Load</button>
         </div>
         <div class="url-error" id="urlError"></div>
+        <div class="paste-hint">You can also paste an image from clipboard (Ctrl+V / Cmd+V)</div>
     </div>
 
     <div id="resultsArea">
@@ -837,6 +868,16 @@
                 <button class="btn-preview-merge" onclick="previewColorMerge()">🔍 Preview Merge</button>
                 <span id="ciUniqueCount" style="font-size:0.85rem; color:#aaa;"></span>
             </div>
+            <div class="ci-row" style="margin-top:4px;">
+                <label style="margin:0; white-space:nowrap;">Target Palettes:</label>
+                <select id="targetPaletteCount" style="background:#222; color:white; border:1px solid #555; padding:4px 8px; border-radius:4px; font-size:0.85rem; cursor:pointer;">
+                    <option value="1">1</option><option value="2">2</option><option value="3">3</option>
+                    <option value="4">4</option><option value="5">5</option><option value="6">6</option>
+                    <option value="7" selected>7</option><option value="8">8</option>
+                </select>
+                <button class="btn-preview-merge" onclick="matchTargetPaletteCount()">🎯 Merge to Target</button>
+                <span id="targetPaletteStatus" class="target-palette-status" style="color:#aaa;"></span>
+            </div>
             <div id="mergePreviewBox" class="merge-preview-box">
                 <div id="mergePreviewStats" class="merge-preview-stats"></div>
                 <button id="btnApplyMerge" class="btn-apply-merge" onclick="applyColorMerge()" disabled>✨ Apply Merge</button>
@@ -847,6 +888,7 @@
             <div class="legend-item"><div class="dot" style="background:red"></div> Bad Tiles (>4 Colors)</div>
             <div class="legend-item"><div class="dot" style="background:none; border:1px solid #555"></div> Click image to cycle Zoom</div>
             <div class="legend-item"><div class="dot" style="background:none; border:1px solid #555"></div> Right-click image to inspect tile</div>
+            <div class="legend-item"><div class="dot" style="background:none; border:1px solid #555"></div> Hold image to see original</div>
         </div>
 
         <p id="imageInfo" style="text-align:center; font-size:0.85rem; color:#aaa; margin: 4px 0 8px; display:none;"></p>
@@ -855,6 +897,7 @@
             <div class="canvas-wrapper">
                 <canvas id="canvas"></canvas>
                 <canvas id="overlayCanvas"></canvas>
+                <div id="beforeAfterBadge" class="before-after-badge">ORIGINAL</div>
             </div>
         </div>
 
@@ -927,6 +970,14 @@
     let _lastMergeFromCount = 0;
     let _lastMergeToCount = 0;
 
+    // --- BEFORE/AFTER PREVIEW STATE ---
+    let _trueOriginalImage = null;
+    let _trueOriginalDataURL = null;
+    let _holdingPreview = false;
+    let _holdSavedCanvasData = null;
+    let _holdSavedOverlayData = null;
+    let _holdStartTime = 0;
+
     // --- PROJECT MANAGEMENT ---
     let projects = [];
     let activeProjectId = null;
@@ -957,6 +1008,7 @@
             imageInfoText: '',
             dirty: false,
             lockedColors: [],
+            trueOriginalDataURL: null,
         };
     }
 
@@ -988,6 +1040,7 @@
         proj.lockedColors = Array.from(lockedColors);
         proj.btnDownloadFixedVisible = document.getElementById('btnDownloadFixed').style.display !== 'none';
         proj.imageInfoText = imageInfo ? imageInfo.textContent : '';
+        proj.trueOriginalDataURL = _trueOriginalDataURL;
     }
 
     function switchToProject(targetId) {
@@ -1026,6 +1079,16 @@
         document.getElementById('btnFixBadTiles').style.display = 'none';
         tileInspector.style.display = 'none';
 
+        // Load true original image for before/after preview
+        _trueOriginalDataURL = proj.trueOriginalDataURL || proj.imageDataURL;
+        if (_trueOriginalDataURL) {
+            const trueImg = new Image();
+            trueImg.onload = () => { _trueOriginalImage = trueImg; };
+            trueImg.src = _trueOriginalDataURL;
+        } else {
+            _trueOriginalImage = null;
+        }
+
         if (proj.imageDataURL) {
             const seq = ++_restoreSeq;
             const img = new Image();
@@ -1057,6 +1120,8 @@
             img.src = proj.imageDataURL;
         } else {
             originalImage = null;
+            _trueOriginalImage = null;
+            _trueOriginalDataURL = null;
             lastBaseImageData = null;
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
@@ -1256,18 +1321,86 @@
     });
     // --- END HISTORY SYSTEM ---
 
+    // --- CLIPBOARD PASTE HANDLING ---
+    document.addEventListener('paste', (e) => {
+        const items = e.clipboardData && e.clipboardData.items;
+        if (!items) return;
+        for (let i = 0; i < items.length; i++) {
+            if (items[i].type.indexOf('image/') === 0) {
+                e.preventDefault();
+                const blob = items[i].getAsFile();
+                if (!blob) continue;
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    processUploadedFiles([{
+                        name: 'pasted-image',
+                        dataURL: event.target.result,
+                    }]);
+                };
+                reader.readAsDataURL(blob);
+                return;
+            }
+        }
+    });
+
     fileInput.addEventListener('change', handleFile);
 
-    // Zoom Logic
+    // Zoom Logic (suppressed during long hold for before/after preview)
     canvas.addEventListener('click', () => {
         if (!originalImage) return;
-        // Cycle zoom: 1 -> 2 -> 4 -> 1
+        if (_holdStartTime && (Date.now() - _holdStartTime > 200)) {
+            _holdStartTime = 0;
+            return;
+        }
+        _holdStartTime = 0;
         if (currentZoom === 1) currentZoom = 2;
         else if (currentZoom === 2) currentZoom = 4;
         else currentZoom = 1;
 
         applyZoom();
     });
+
+    // --- Before/after preview handlers ---
+    function beginHoldPreview() {
+        if (!_trueOriginalImage || !originalImage) return;
+        _holdingPreview = true;
+        _holdSavedCanvasData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        _holdSavedOverlayData = overlayCtx.getImageData(0, 0, overlayCanvas.width, overlayCanvas.height);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(_trueOriginalImage, 0, 0);
+        overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+        const badge = document.getElementById('beforeAfterBadge');
+        if (badge) badge.classList.add('visible');
+    }
+
+    function endHoldPreview() {
+        if (!_holdingPreview) return;
+        _holdingPreview = false;
+        if (_holdSavedCanvasData) {
+            ctx.putImageData(_holdSavedCanvasData, 0, 0);
+            _holdSavedCanvasData = null;
+        }
+        if (_holdSavedOverlayData) {
+            overlayCtx.putImageData(_holdSavedOverlayData, 0, 0);
+            _holdSavedOverlayData = null;
+        }
+        const badge = document.getElementById('beforeAfterBadge');
+        if (badge) badge.classList.remove('visible');
+    }
+
+    canvas.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        _holdStartTime = Date.now();
+        beginHoldPreview();
+    });
+    canvas.addEventListener('mouseup', endHoldPreview);
+    canvas.addEventListener('mouseleave', endHoldPreview);
+    canvas.addEventListener('touchstart', (e) => {
+        _holdStartTime = Date.now();
+        beginHoldPreview();
+    }, { passive: true });
+    canvas.addEventListener('touchend', endHoldPreview);
+    canvas.addEventListener('touchcancel', endHoldPreview);
 
     // Tile Inspector (right-click)
     canvas.addEventListener('contextmenu', (e) => {
@@ -1399,12 +1532,15 @@
             if (reuseEmpty) {
                 activeProj.name = result.name;
                 activeProj.imageDataURL = result.dataURL;
+                activeProj.trueOriginalDataURL = result.dataURL;
                 activeProj.dirty = true;
                 reusedCurrent = true;
                 const img = new Image();
                 img.onload = () => {
                     applyAction('Load Image', () => {
                         originalImage = img;
+                        _trueOriginalImage = img;
+                        _trueOriginalDataURL = result.dataURL;
                         activeHighlightIndex = -1;
                         currentZoom = 1;
                         document.getElementById('btnDownloadFixed').style.display = 'none';
@@ -1421,6 +1557,7 @@
                 saveCurrentProjectState();
                 const proj = createNewProject(result.name);
                 proj.imageDataURL = result.dataURL;
+                proj.trueOriginalDataURL = result.dataURL;
                 proj.dirty = true;
                 projects.push(proj);
                 lastNewProjectId = proj.id;
@@ -2461,6 +2598,134 @@
         scheduleAutoSave();
     }
 
+    // --- TARGET PALETTE COUNT THRESHOLD SEARCH ---
+    function precomputeTileColorSets() {
+        if (!lastBaseImageData) return [];
+        const data = lastBaseImageData.data;
+        const width = lastBaseImageData.width;
+        const height = lastBaseImageData.height;
+        const snap = getSnapFn();
+        const tileSets = [];
+        for (let y = 0; y < height; y += 8) {
+            for (let x = 0; x < width; x += 8) {
+                const colors = new Set();
+                for (let dy = 0; dy < 8; dy++) {
+                    for (let dx = 0; dx < 8; dx++) {
+                        if (x + dx >= width || y + dy >= height) continue;
+                        const i = ((y + dy) * width + (x + dx)) * 4;
+                        if (data[i + 3] < 128) continue;
+                        const [r, g, b] = snap(data[i], data[i + 1], data[i + 2]);
+                        colors.add(rgbToHex(r, g, b));
+                    }
+                }
+                if (colors.size > 0) tileSets.push(colors);
+            }
+        }
+        return tileSets;
+    }
+
+    function simulatePaletteCountFromSets(tileSets, mergeMap) {
+        const masterPalettes = [];
+        for (const origColors of tileSets) {
+            const colors = new Set();
+            for (const c of origColors) {
+                colors.add(mergeMap.has(c) ? mergeMap.get(c) : c);
+            }
+            if (colors.size === 0 || colors.size > 4) continue;
+            const currentColors = Array.from(colors);
+            let bestFitIndex = -1;
+            let minNewColors = 5;
+            for (let pIdx = 0; pIdx < masterPalettes.length; pIdx++) {
+                const master = masterPalettes[pIdx];
+                const combined = new Set([...master, ...currentColors]);
+                if (combined.size <= 4) {
+                    const newColorsAdded = combined.size - master.length;
+                    if (newColorsAdded < minNewColors) {
+                        minNewColors = newColorsAdded;
+                        bestFitIndex = pIdx;
+                    }
+                    if (newColorsAdded === 0) break;
+                }
+            }
+            if (bestFitIndex !== -1) {
+                const master = masterPalettes[bestFitIndex];
+                const combined = new Set([...master, ...currentColors]);
+                master.length = 0;
+                master.push(...Array.from(combined));
+            } else {
+                masterPalettes.push(currentColors);
+            }
+        }
+        return masterPalettes.length;
+    }
+
+    function matchTargetPaletteCount() {
+        const targetCount = parseInt(document.getElementById('targetPaletteCount').value);
+        const statusEl = document.getElementById('targetPaletteStatus');
+        if (!lastBaseImageData) { statusEl.textContent = 'No image loaded'; return; }
+
+        statusEl.textContent = 'Searching\u2026';
+        statusEl.style.color = '#aaa';
+
+        // Defer to let UI update before the heavy computation
+        setTimeout(() => {
+            const colorCounts = collectImageColors();
+            if (colorCounts.size === 0) { statusEl.textContent = 'No colors found'; return; }
+            const tileSets = precomputeTileColorSets();
+
+            // Coarse stepped search over the threshold range, then fine refinement
+            const cache = new Map();
+            let bestThreshold = 1;
+            let bestCount = Infinity;
+            let bestDiff = Infinity;
+
+            function evaluate(t) {
+                if (cache.has(t)) return cache.get(t);
+                const mergeMap = computeMergeMap(colorCounts, t);
+                const count = simulatePaletteCountFromSets(tileSets, mergeMap);
+                cache.set(t, count);
+                return count;
+            }
+
+            const coarseSteps = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 25, 30, 35, 40, 45, 50];
+            for (const t of coarseSteps) {
+                const count = evaluate(t);
+                const diff = Math.abs(count - targetCount);
+                if (diff < bestDiff || (diff === bestDiff && t < bestThreshold)) {
+                    bestDiff = diff; bestCount = count; bestThreshold = t;
+                }
+                if (diff === 0) break;
+            }
+
+            if (bestDiff > 0) {
+                const lo = Math.max(1, bestThreshold - 5);
+                const hi = Math.min(50, bestThreshold + 5);
+                for (let t = lo; t <= hi; t += 0.5) {
+                    const count = evaluate(t);
+                    const diff = Math.abs(count - targetCount);
+                    if (diff < bestDiff || (diff === bestDiff && t < bestThreshold)) {
+                        bestDiff = diff; bestCount = count; bestThreshold = t;
+                    }
+                    if (diff === 0) break;
+                }
+            }
+
+            const slider = document.getElementById('ciThreshold');
+            slider.value = bestThreshold;
+            document.getElementById('ciThresholdValue').textContent = bestThreshold.toFixed(1);
+
+            previewColorMerge();
+
+            if (bestCount === targetCount) {
+                statusEl.textContent = 'Matched ' + targetCount + ' palettes at threshold ' + bestThreshold.toFixed(1);
+                statusEl.style.color = 'var(--success)';
+            } else {
+                statusEl.textContent = 'Closest: ' + bestCount + ' palettes at threshold ' + bestThreshold.toFixed(1);
+                statusEl.style.color = 'var(--warning)';
+            }
+        }, 10);
+    }
+
     function downloadFixedImage() {
         const link = document.createElement('a');
         link.download = 'fixed_palette_scene.png';
@@ -2735,6 +3000,15 @@
                     catch (_) { imageBlob = null; }
                 }
 
+                const trueOrigURL = (proj.id === activeProjectId)
+                    ? (_trueOriginalDataURL || proj.trueOriginalDataURL)
+                    : proj.trueOriginalDataURL;
+                let trueOrigBlob = null;
+                if (trueOrigURL && trueOrigURL.startsWith('data:')) {
+                    try { trueOrigBlob = dataURLToBlob(trueOrigURL); }
+                    catch (_) { trueOrigBlob = null; }
+                }
+
                 const trimmedUndo = (proj.undoStack || []).slice(-PERSIST_UNDO_LIMIT).map(serializeSnapshot);
                 const trimmedRedo = (proj.redoStack || []).slice(-PERSIST_UNDO_LIMIT).map(serializeSnapshot);
 
@@ -2743,6 +3017,7 @@
                     id: proj.id,
                     name: proj.name,
                     imageBlob: imageBlob,
+                    trueOriginalImageBlob: trueOrigBlob,
                     palettes: JSON.parse(JSON.stringify(proj.palettes || [])),
                     tileMappings: JSON.parse(JSON.stringify(proj.tileMappings || [])),
                     paletteCounts: (proj.paletteCounts || []).slice(),
@@ -2819,6 +3094,16 @@
                     }
                 }
 
+                if (rec.trueOriginalImageBlob) {
+                    try {
+                        proj.trueOriginalDataURL = await blobToDataURL(rec.trueOriginalImageBlob);
+                    } catch (e) {
+                        proj.trueOriginalDataURL = proj.imageDataURL;
+                    }
+                } else {
+                    proj.trueOriginalDataURL = proj.imageDataURL;
+                }
+
                 proj.palettes = rec.palettes || [];
                 proj.tileMappings = rec.tileMappings || [];
                 proj.paletteCounts = rec.paletteCounts || [];
@@ -2884,6 +3169,15 @@
                     updateHistoryButtons();
                 };
                 img.src = activeProj.imageDataURL;
+            }
+
+            _trueOriginalDataURL = activeProj.trueOriginalDataURL || activeProj.imageDataURL;
+            if (_trueOriginalDataURL) {
+                const trueImg = new Image();
+                trueImg.onload = () => { _trueOriginalImage = trueImg; };
+                trueImg.src = _trueOriginalDataURL;
+            } else {
+                _trueOriginalImage = null;
             }
 
             renderTabs();
